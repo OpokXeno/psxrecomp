@@ -6568,7 +6568,7 @@ static int native_gpu_program_init(void) {
     if (s_native_gpu_program) return 1;
     s_native_gpu_interlock = p_glBindImageTexture && p_glMemoryBarrier && p_glTexBuffer && p_glMultiDrawArrays &&
         SDL_GL_ExtensionSupported("GL_ARB_fragment_shader_interlock") &&
-        !(getenv("PSX_NATIVE_GPU_INTERLOCK") && getenv("PSX_NATIVE_GPU_INTERLOCK")[0]=='0');
+        getenv("PSX_NATIVE_GPU_INTERLOCK") && getenv("PSX_NATIVE_GPU_INTERLOCK")[0]=='1';
     if (s_native_gpu_interlock) {
         const char *option=getenv("PSX_NATIVE_GENERIC_RASTER");
         s_native_gpu_program=option && option[0]=='1'

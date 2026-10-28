@@ -148,6 +148,10 @@ static struct {
     uint64_t composes, compose_failures, swaps, swap_failures, swap_skips, retired;
     uint64_t compose_draws, compose_reuses, image_updates, phase_composes;
     uint64_t gpu_composes, gpu_compose_ns;
+    /* Swap pass (scene copy and UI) timing, two queries per frame slot. */
+    VkQueryPool swap_timestamps;
+    uint8_t swap_timed[NVKP_SLOTS];
+    uint64_t gpu_swaps, gpu_swap_ns;
     int wait_diagnostics;
     uint64_t compose_wait_ns, ui_consume_wait_ns, scene_rebuilds, ui_updates;
     char reason[160];
@@ -984,6 +988,19 @@ static void nvkp_swap(void *user_data)
         if (T.current) T.current->acquire_end_ns = nvkp_clock_ns(NULL);
         if (got == VK_SWAP_ACQUIRE_OK) {
             VkCommandBuffer cmd = frame.cmd;
+            const uint32_t timed = frame.slot % NVKP_SLOTS;
+            if (P.swap_timestamps) {
+                /* Acquiring the frame slot waited for its previous submission. */
+                uint64_t times[2];
+                if (P.swap_timed[timed] && vkGetQueryPoolResults(vk_core_device(), P.swap_timestamps, timed * 2u, 2u,
+                        sizeof(times), times, sizeof(times[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                    ++P.gpu_swaps;
+                    P.gpu_swap_ns += (uint64_t)((times[1] - times[0]) * (double)vk_core_caps()->timestamp_period_ns);
+                }
+                vkCmdResetQueryPool(cmd, P.swap_timestamps, timed * 2u, 2u);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P.swap_timestamps, timed * 2u);
+                P.swap_timed[timed] = 1;
+            }
             if (!P.publish_barriers) nvkp_barrier_all(cmd);
             vk_swapchain_begin_render_pass(&frame);
             const VkViewport viewport = { 0.f, 0.f, (float)frame.width, (float)frame.height, 0.f, 1.f };
@@ -1034,6 +1051,8 @@ static void nvkp_swap(void *user_data)
             } else ui = -1;
             vk_swapchain_end_render_pass(&frame);
             if (P.publish_barriers) nvkp_release_scene(cmd);
+            if (P.swap_timestamps)
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P.swap_timestamps, timed * 2u + 1u);
             if (T.current) {
                 T.current->present_begin_ns = nvkp_clock_ns(NULL);
                 if (T.feedback_active)
@@ -1213,6 +1232,9 @@ static void nvkp_destroy(void)
     if (!vk_core_ready()) { memset(&P, 0, sizeof(P)); return; }
     VkDevice dev = vk_core_device();
     (void)vk_core_device_wait_idle();
+    if (P.swap_timestamps) vkDestroyQueryPool(dev, P.swap_timestamps, NULL);
+    P.swap_timestamps = VK_NULL_HANDLE;
+    memset(P.swap_timed, 0, sizeof(P.swap_timed));
     nvkp_scene_destroy();
     for (unsigned i = 0u; i < NVKP_UI_LAYERS; ++i) {
         nvkp_ui_layer_destroy(&P.ui[i]);
@@ -1285,7 +1307,8 @@ static int nvkp_create(struct SDL_Window *window)
     const char *damage = getenv("PSX_NATIVE_VK_SMAA_DAMAGE");
     const char *audit = getenv("PSX_NATIVE_VK_SMAA_AUDIT");
     const char *regions = getenv("PSX_NATIVE_VK_SMAA_REGIONS");
-    P.smaa_damage = damage && damage[0] == '1';
+    /* Damaged resolves match complete ones bit for bit (PSX_NATIVE_VK_SMAA_AUDIT). */
+    P.smaa_damage = !(damage && damage[0] == '0');
     P.smaa_audit = P.smaa_damage && audit && audit[0] == '1';
     P.smaa_regions = !P.smaa_damage || !regions ? 0 : regions[0] == '2' ? 2 : regions[0] == '1' ? 1 : 0;
     if (P.smaa_prepass) {
@@ -1355,6 +1378,11 @@ static int nvkp_create(struct SDL_Window *window)
     static const VkDescriptorPoolSize slot_sizes[2] = {
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8u }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4u } };
     const char *gpu_timing = getenv("PSX_NATIVE_VK_GPU_TIMING");
+    if (gpu_timing && gpu_timing[0] == '1' && vk_core_caps()->timestamps) {
+        VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2u * NVKP_SLOTS;
+        if (!vk_core_check(vkCreateQueryPool(dev, &qi, NULL, &P.swap_timestamps), "vkCreateQueryPool")) return 0;
+    }
     for (unsigned i = 0u; i < NVKP_SLOTS; ++i) {
         NvkpSlot *slot = &P.slots[i];
         if (gpu_timing && gpu_timing[0] == '1' && vk_core_caps()->timestamps) {
@@ -1500,7 +1528,7 @@ int native_vk_services_json(char *out, int capacity)
         "\"swap_skips\":%llu,\"retired\":%llu,\"scene\":[%u,%u],\"lut\":%d,\"frames_presented\":%llu,"
         "\"compose_draws\":%llu,\"compose_reuses\":%llu,\"image_updates\":%llu,\"phase_composes\":%llu,"
         "\"partial_composes\":%llu,\"partial_pixels\":%llu,\"partial_regions\":%llu,\"full_pixels\":%llu,\"audit_checks\":%llu,\"audit_mismatches\":%llu,"
-        "\"gpu_composes\":%llu,\"gpu_compose_ns\":%llu,\"ui_clip\":[%d,%d,%d,%d],\"ui_storage\":[%u,%u],"
+        "\"gpu_composes\":%llu,\"gpu_compose_ns\":%llu,\"gpu_swaps\":%llu,\"gpu_swap_ns\":%llu,\"ui_clip\":[%d,%d,%d,%d],\"ui_storage\":[%u,%u],"
         "\"window_maximized\":%d,\"window_fullscreen\":%d,\"window_focused\":%d,\"window_mouse_focused\":%d,"
         "\"compose_wait_ns\":%llu,\"ui_consume_wait_ns\":%llu,\"scene_rebuilds\":%llu,\"ui_updates\":%llu,\"executor\":%s}",
         display == primary, display, (double)mode.refresh_rate, P.services, (unsigned long long)P.composes, (unsigned long long)P.compose_failures, (unsigned long long)P.swaps,
@@ -1511,7 +1539,8 @@ int native_vk_services_json(char *out, int capacity)
         (unsigned long long)P.partial_composes, (unsigned long long)P.partial_pixels,
         (unsigned long long)P.partial_regions, (unsigned long long)P.full_pixels,
         (unsigned long long)P.audit_checks, (unsigned long long)P.audit_mismatches,
-        (unsigned long long)P.gpu_composes, (unsigned long long)P.gpu_compose_ns, clip[0], clip[1], clip[2], clip[3], ui_storage[0], ui_storage[1],
+        (unsigned long long)P.gpu_composes, (unsigned long long)P.gpu_compose_ns,
+        (unsigned long long)P.gpu_swaps, (unsigned long long)P.gpu_swap_ns, clip[0], clip[1], clip[2], clip[3], ui_storage[0], ui_storage[1],
         (window_flags & SDL_WINDOW_MAXIMIZED) != 0u, (window_flags & SDL_WINDOW_FULLSCREEN) != 0u,
         (window_flags & SDL_WINDOW_INPUT_FOCUS) != 0u, (window_flags & SDL_WINDOW_MOUSE_FOCUS) != 0u,
         (unsigned long long)P.compose_wait_ns, (unsigned long long)P.ui_consume_wait_ns,

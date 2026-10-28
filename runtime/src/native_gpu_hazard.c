@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-NativeSchedState s_sched;
+_Thread_local NativeSchedState s_sched;
+_Thread_local NativeHzGrid g_native_hz_grid;
 
 void native_gpu_hazards_clear(GlNativeGpuHazards *hz) {
     for (uint32_t i = 0; i < hz->touched_count; ++i) hz->cell_n[hz->touched[i]] = 0;
@@ -19,7 +20,7 @@ int native_gpu_shape_tri(GlNativeGpuShape *s, const float *v0, const float *v1, 
     /* Repeated vertices rasterize nothing. Collinear distinct ones stay: float
      * rounding in the vertex shader may give them a sliver of area. */
     if (!memcmp(s->p[0], s->p[1], 8) || !memcmp(s->p[1], s->p[2], 8) || !memcmp(s->p[0], s->p[2], 8)) return 0;
-    s->off = off; s->tri = 1; s->mag = 0.f;
+    s->off = off; s->tri = 1; s->mag = 0.f; s->gpage = -2;
     s->box[0] = s->box[1] = INFINITY; s->box[2] = s->box[3] = -INFINITY;
     for (int i = 0; i < 3; ++i)
         for (int a = 0; a < 2; ++a) {
@@ -98,42 +99,133 @@ static int native_gpu_vertex_separated(const GlNativeGpuShape *t, int ti, const 
     return 0;
 }
 
+/* Unit inward edge normals of t and n . vertex; (0, 0, 0) for a null edge. */
+static void native_gpu_tri_normals(const GlNativeGpuShape *t, const double edge[3][5], double n[3][3]) {
+    const double area = ((double)t->v[1][0] - t->v[0][0]) * ((double)t->v[2][1] - t->v[0][1]) -
+                        ((double)t->v[1][1] - t->v[0][1]) * ((double)t->v[2][0] - t->v[0][0]);
+    const double sign = area < 0.0 ? -1.0 : 1.0;
+    for (int i = 0; i < 3; ++i) {
+        const double ex = edge[i][0], ey = edge[i][1], len = edge[i][2];
+        if (!(len > 0.0)) { n[i][0] = n[i][1] = n[i][2] = 0.0; continue; }
+        n[i][0] = -ey * sign / len; n[i][1] = ex * sign / len;
+        n[i][2] = n[i][0] * t->v[i][0] + n[i][1] * t->v[i][1];
+    }
+}
+
 /* 1 when some pixel centre (x + 0.5, y + 0.5) lies within m of both triangles:
  * each triangle grown by m is six half-planes, and each centre row of their
- * common box gives one x interval to test. Rows beyond the cap count as hits. */
-static int native_gpu_tris_share_centre(const GlNativeGpuShape *a, const GlNativeGpuShape *b, double m) {
-    double nx[6], ny[6], c[6];
-    for (int s = 0; s < 2; ++s) {
-        const GlNativeGpuShape *t = s ? b : a;
-        const double area = ((double)t->v[1][0] - t->v[0][0]) * ((double)t->v[2][1] - t->v[0][1]) -
-                            ((double)t->v[1][1] - t->v[0][1]) * ((double)t->v[2][0] - t->v[0][0]);
-        const double sign = area < 0.0 ? -1.0 : 1.0;
-        for (int i = 0; i < 3; ++i) {
-            const double x0 = t->v[i][0], y0 = t->v[i][1];
-            const double ex = t->edge[i][0], ey = t->edge[i][1], len = t->edge[i][2];
-            const int k = s * 3 + i;
-            if (!(len > 0.0)) { nx[k] = ny[k] = 0.0; c[k] = -1.0; continue; } /* always satisfied */
-            /* inside: n . P >= c, with n the unit inward normal */
-            nx[k] = -ey * sign / len; ny[k] = ex * sign / len;
-            c[k] = nx[k] * x0 + ny[k] * y0 - m;
-        }
-    }
-    const double y0 = fmax(a->box[1], b->box[1]) - m, y1 = fmin(a->box[3], b->box[3]) + m;
+ * common box gives one x interval to test. More rows than the cap count as hits. */
+static int native_gpu_share_rows(const double an[3][3], const float *abox, const double bn[3][3], const float *bbox,
+                                 double m, double rows) {
+    const double y0 = fmax(abox[1], bbox[1]) - m, y1 = fmin(abox[3], bbox[3]) + m;
     const double r0 = ceil(y0 - 0.5), r1 = floor(y1 - 0.5);
-    if (r1 - r0 > 1024.0) return 1;
-    const double x0 = fmax(a->box[0], b->box[0]) - m, x1 = fmin(a->box[2], b->box[2]) + m;
+    if (r1 - r0 > rows) return 1;
+    const double x0 = fmax(abox[0], bbox[0]) - m, x1 = fmin(abox[2], bbox[2]) + m;
+    /* inside: n . P >= n . V - m; a null edge always holds. On centre row yc a
+     * slanted edge bounds x by base + slope * yc from one side; a horizontal
+     * one admits the whole row or none of it. */
+    double lo_base[6], lo_slope[6], hi_base[6], hi_slope[6], flat_c[6], flat_y[6];
+    int lo_count = 0, hi_count = 0, flat_count = 0;
+    for (int k = 0; k < 6; ++k) {
+        const double *n = k < 3 ? an[k] : bn[k - 3];
+        if (n[0] == 0.0 && n[1] == 0.0) continue;
+        const double c = n[2] - m;
+        if (n[0] > 1e-12) { lo_base[lo_count] = c / n[0]; lo_slope[lo_count++] = -n[1] / n[0]; }
+        else if (n[0] < -1e-12) { hi_base[hi_count] = c / n[0]; hi_slope[hi_count++] = -n[1] / n[0]; }
+        else { flat_c[flat_count] = c; flat_y[flat_count++] = n[1]; }
+    }
     for (double r = r0; r <= r1; r += 1.0) {
         const double yc = r + 0.5;
         double lo = x0, hi = x1;
-        for (int k = 0; k < 6 && lo <= hi; ++k) {
-            const double rhs = c[k] - ny[k] * yc;
-            if (nx[k] > 1e-12) { const double v = rhs / nx[k]; if (v > lo) lo = v; }
-            else if (nx[k] < -1e-12) { const double v = rhs / nx[k]; if (v < hi) hi = v; }
-            else if (rhs > 0.0) hi = lo - 1.0;
-        }
+        for (int k = 0; k < flat_count; ++k) if (flat_c[k] - flat_y[k] * yc > 0.0) hi = lo - 1.0;
+        for (int k = 0; k < lo_count; ++k) { const double v = lo_base[k] + lo_slope[k] * yc; if (v > lo) lo = v; }
+        for (int k = 0; k < hi_count; ++k) { const double v = hi_base[k] + hi_slope[k] * yc; if (v < hi) hi = v; }
         if (lo <= hi && ceil(lo - 0.5) <= floor(hi - 0.5)) return 1;
     }
     return 0;
+}
+
+static int native_gpu_tris_share_centre(const GlNativeGpuShape *a, const GlNativeGpuShape *b, double m, double rows) {
+    double an[3][3], bn[3][3];
+    native_gpu_tri_normals(a, a->edge, an);
+    native_gpu_tri_normals(b, b->edge, bn);
+    return native_gpu_share_rows(an, a->box, bn, b->box, m, rows);
+}
+
+/* Maps a point into the active grid through the page that holds rows lo..hi
+ * of the shape; 0 when they span pages. */
+static int native_gpu_grid_point(double *x, double *y, double lo, double hi) {
+    const NativeHzGrid *g = &g_native_hz_grid;
+    double origin = 0.0, pixel = 0.0;
+    if (g->page_rows) {
+        const double page = floor(fmax(lo, 0.0) / g->page_rows);
+        if (floor(fmax(hi, 0.0) / g->page_rows) != page) return 0;
+        origin = page * g->page_rows; pixel = page * g->page_pixels;
+    }
+    /* native_gpu.vert: shape pixel centres (k + 0.5) land on host centres. */
+    *x = (*x - 0.5) * g->sx + 0.5;
+    *y = (*y - origin - 0.5) * g->sy + 0.5 + pixel;
+    return 1;
+}
+
+static int native_gpu_grid_shape(const GlNativeGpuShape *s, double m, GlNativeGpuShape *out) {
+    *out = *s;
+    out->box[0] = out->box[1] = INFINITY; out->box[2] = out->box[3] = -INFINITY;
+    for (int i = 0; i < 3; ++i) {
+        double x = s->v[i][0], y = s->v[i][1];
+        if (!native_gpu_grid_point(&x, &y, s->box[1] - m, s->box[3] + m)) return 0;
+        out->v[i][0] = (float)x; out->v[i][1] = (float)y;
+        for (int a = 0; a < 2; ++a) {
+            if (out->v[i][a] < out->box[a]) out->box[a] = out->v[i][a];
+            if (out->v[i][a] > out->box[a + 2]) out->box[a + 2] = out->v[i][a];
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        double *e = out->edge[i];
+        e[0] = (double)out->v[(i + 1) % 3][0] - out->v[i][0];
+        e[1] = (double)out->v[(i + 1) % 3][1] - out->v[i][1];
+        e[2] = sqrt(e[0] * e[0] + e[1] * e[1]);
+    }
+    return 1;
+}
+
+/* The page test margin of the cached grid data: it gives the same pages as
+ * any overlap margin up to it. */
+#define NATIVE_HZ_PAGE_MARGIN 1.0
+
+/* Fills s's grid data for the active grid. The cache is not part of the
+ * shape's value, so const shapes fill it too. */
+static const GlNativeGpuShape *native_gpu_grid_cached(const GlNativeGpuShape *shape) {
+    GlNativeGpuShape *s = (GlNativeGpuShape *)shape;
+    const NativeHzGrid *g = &g_native_hz_grid;
+    if (s->gpage != -2 && s->gsx == g->sx && s->gsy == g->sy && s->grows == g->page_rows && s->gpixels == g->page_pixels)
+        return s;
+    s->gsx = g->sx; s->gsy = g->sy; s->grows = g->page_rows; s->gpixels = g->page_pixels;
+    GlNativeGpuShape t;
+    if (!native_gpu_grid_shape(s, NATIVE_HZ_PAGE_MARGIN, &t)) { s->gpage = -1; return s; }
+    s->gpage = g->page_rows ? (int32_t)floor(fmax(s->box[1] - NATIVE_HZ_PAGE_MARGIN, 0.0) / g->page_rows) : 0;
+    native_gpu_tri_normals(&t, t.edge, s->gn);
+    memcpy(s->gbox, t.box, sizeof(s->gbox));
+    return s;
+}
+
+/* native_gpu_tris_share_centre on the pixel grid the plane rasterizes. Shapes
+ * in different pages, or spanning one, count as sharing a centre. */
+static int native_gpu_tris_share_centre_grid(const GlNativeGpuShape *a, const GlNativeGpuShape *b, double m) {
+    const NativeHzGrid *g = &g_native_hz_grid;
+    if (!g->active) return native_gpu_tris_share_centre(a, b, m, 1024.0);
+    /* The fixed part of the margin is in raster pixels; the relative part
+     * follows the coordinate magnitude, as does the row cap. */
+    const double gm = NATIVE_HZ_MARGIN + (m - NATIVE_HZ_MARGIN) * fmax(g->sx, g->sy), rows = 1024.0 * g->sy;
+    if (m <= NATIVE_HZ_PAGE_MARGIN) {
+        a = native_gpu_grid_cached(a); b = native_gpu_grid_cached(b);
+        if (a->gpage < 0 || b->gpage < 0 || a->gpage != b->gpage) return 1;
+        return native_gpu_share_rows(a->gn, a->gbox, b->gn, b->gbox, gm, rows);
+    }
+    GlNativeGpuShape ga, gb;
+    if (!native_gpu_grid_shape(a, m, &ga) || !native_gpu_grid_shape(b, m, &gb)) return 1;
+    if (g->page_rows && floor(fmax(a->box[1] - m, 0.0) / g->page_rows) != floor(fmax(b->box[1] - m, 0.0) / g->page_rows)) return 1;
+    return native_gpu_tris_share_centre(&ga, &gb, gm, rows);
 }
 
 /* Could the two shapes produce a fragment at the same pixel? Conservative:
@@ -148,9 +240,16 @@ static int native_gpu_shape_overlap(const GlNativeGpuShape *a, const GlNativeGpu
          * endpoints (and weights, so identical window coordinates) on strictly
          * opposite sides never both cover a pixel. */
         int ai[3], bi[3], shared = 0;
+        uint64_t pa[3], pb[3];
+        uint32_t qa[3], qb[3];
+        /* Bitwise vertex identity: compare the float bits as integers. */
+        for (int i = 0; i < 3; ++i) {
+            memcpy(&pa[i], a->p[i], 8); memcpy(&pb[i], b->p[i], 8);
+            memcpy(&qa[i], &a->q[i], 4); memcpy(&qb[i], &b->q[i], 4);
+        }
         for (int i = 0; i < 3 && shared < 3; ++i)
             for (int j = 0; j < 3; ++j)
-                if (!memcmp(a->p[i], b->p[j], 8) && !memcmp(&a->q[i], &b->q[j], 4)) { ai[shared] = i; bi[shared++] = j; break; }
+                if (pa[i] == pb[j] && qa[i] == qb[j]) { ai[shared] = i; bi[shared++] = j; break; }
         if (shared == 2) {
             const float *s0 = a->p[ai[0]], *s1 = a->p[ai[1]];
             const float *ta = a->p[3 - ai[0] - ai[1]], *tb = b->p[3 - bi[0] - bi[1]];
@@ -167,7 +266,9 @@ static int native_gpu_shape_overlap(const GlNativeGpuShape *a, const GlNativeGpu
          * closures meet only at V, which no fragment uses unless V lies on a
          * pixel centre. */
         if (shared == 1) {
-            const double fx = a->v[ai[0]][0] - floor(a->v[ai[0]][0]), fy = a->v[ai[0]][1] - floor(a->v[ai[0]][1]);
+            double vx = a->v[ai[0]][0], vy = a->v[ai[0]][1];
+            if (g_native_hz_grid.active && !native_gpu_grid_point(&vx, &vy, a->box[1] - m, a->box[3] + m)) return 1;
+            const double fx = vx - floor(vx), fy = vy - floor(vy);
             if ((fabs(fx - 0.5) > 1.0 / 128.0 || fabs(fy - 0.5) > 1.0 / 128.0) &&
                 (native_gpu_vertex_separated(a, ai[0], b, bi[0], m) || native_gpu_vertex_separated(b, bi[0], a, ai[0], m)))
                 return 0;
@@ -175,7 +276,7 @@ static int native_gpu_shape_overlap(const GlNativeGpuShape *a, const GlNativeGpu
     }
     if (a->tri && native_gpu_shape_separated(a, b, m)) return 0;
     if (b->tri && native_gpu_shape_separated(b, a, m)) return 0;
-    if (a->tri && b->tri && !native_gpu_tris_share_centre(a, b, m)) return 0;
+    if (a->tri && b->tri && !native_gpu_tris_share_centre_grid(a, b, m)) return 0;
     return 1;
 }
 

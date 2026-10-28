@@ -11292,7 +11292,7 @@ XgRenderCompileResult native_worker_compile(XgRenderSourceCommitHandle commit,
             timing = gpu->timing; prepared_cpu_ns = prefetch->cpu_ns;
             (void)xg_render_source_commit_release_read(prefetch->commit);
             --s_native_prefetch_count;
-            if (s_native_prefetch_count) s_native_prefetch[0] = s_native_prefetch[1];
+            memmove(&s_native_prefetch[0], &s_native_prefetch[1], s_native_prefetch_count * sizeof(s_native_prefetch[0]));
             memset(&s_native_prefetch[s_native_prefetch_count], 0, sizeof(s_native_prefetch[0]));
             SDL_LockMutex(s_native_state_mutex);
             ++s_native_compiler_diag.gpu.prefetch_used;

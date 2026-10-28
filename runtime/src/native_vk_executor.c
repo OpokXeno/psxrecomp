@@ -80,6 +80,7 @@ int native_vk_backend_json(char *out, int capacity)
 #include "vk_core.h"
 #include "vk_shaders_spv.h"
 #include "native_vk_depth_bounds.h"
+#include "host_parallel.h"
 
 /* ---- constants ----------------------------------------------------------- */
 enum {
@@ -88,6 +89,7 @@ enum {
     NVK_SLOT = 3 * NVK_SLOT_ALIGN,  /* NvkView at 0, NvkDraw at 256 */
     NVK_SET0_CACHE = 4096,
     NVK_MISMATCH_RING = 16,
+    NVK_COMMIT_HISTORY = 8,
     NVK_WORDS_BYTES = VRAM_W * VRAM_H * 2,
     NVK_IMAGES = GL_NATIVE_MOTION_PHASE_CAPACITY + 1u,
     NVK_UNIFORM_DEPTH_ATTACHED = 1, NVK_UNIFORM_DEPTH_READ = 2
@@ -132,6 +134,10 @@ typedef struct NvkPlane {
     VkFramebuffer framebuffer;
     VkFramebuffer capture_framebuffer;
     VkImageView alpha_view;  /* scan: the R8 mask read as alpha (GL mask swizzle A<-R) */
+    /* scan: views of a copied image, whose colour alpha holds the class byte:
+     * colour with opaque alpha, and that alpha as the mask. copied selects them. */
+    VkImageView copy_color_view, copy_alpha_view;
+    int copied;
     uint32_t width, height; /* virtual raster extent; color.width/height are physical */
     float raster[4]; /* virtual/physical X,Y; physical viewport origin X,Y */
     uint32_t page_rows, page_pixels; /* shared VRAM aliases start on integer pixels */
@@ -150,6 +156,12 @@ typedef struct NvkPlane {
     int32_t damage_bounds[4];
     int damage_regions_side;
     int32_t damage_regions[NATIVE_VK_DAMAGE_REGIONS][4]; /* half-open scanout pixels */
+    /* Base planes: the committed state these pixels equal (0: none), the
+     * committed state a work started from, and the physical pixels written
+     * since then (x0, y0, x1, y1; empty when x0 >= x1). */
+    uint64_t content_seq, base_seq;
+    int written_all;
+    int32_t written[4];
 } NvkPlane;
 
 typedef struct NvkChunk {
@@ -186,6 +198,7 @@ static struct {
     int core_batch, hd_batch, hd_record_buffer, vertex_footprint, first_vertex_records, lazy_vertices;
     int phase_damage, depth_bounds, shader_damage, damage_regions;
     unsigned damage_tile_shift;
+    int damage_tile_set;    /* PSX_NATIVE_VK_DAMAGE_TILE chose the tile for every plane */
     int capture_enabled, linked_capture, publish_barriers;
     int merge_capture, sort_capture, direct_capture;
     VkRenderPass pass_capture;
@@ -260,6 +273,14 @@ static struct {
     uint32_t hd_garbage_count, hd_garbage_cap;
     /* what the GL executor keeps in globals */
     NvkPlane committed[GL_NATIVE_GPU_PHASE_BASE];
+    /* The pixels each recent publication changed in every base plane. A
+     * retired plane is brought up to date by copying only their union. */
+    int committed_delta;    /* PSX_NATIVE_VK_COMMITTED_DELTA=0 copies whole committed planes */
+    int merge_runs;         /* PSX_NATIVE_VK_MERGE_RUNS=0 schedules template and draw runs apart */
+    int scan_copy;          /* PSX_NATIVE_VK_SCAN_COPY=0 resolves 1:1 phase images by raster */
+    uint64_t commit_seq, commit_tag[NVK_COMMIT_HISTORY];
+    uint8_t commit_all[NVK_COMMIT_HISTORY][GL_NATIVE_GPU_PHASE_BASE];
+    int32_t commit_written[NVK_COMMIT_HISTORY][GL_NATIVE_GPU_PHASE_BASE][4];
     NvkPlane bases[GL_NATIVE_VIEW_TARGET_CAPACITY];
     NvkPlane spare[GL_NATIVE_GPU_PLANES];
     NvkPlane images[NVK_IMAGES];
@@ -334,11 +355,15 @@ static struct {
     uint32_t submit_query;
     uint8_t scanned_images[NVK_IMAGES];
     int damage_active, damage_region;
+    uint32_t run_first, run_end;   /* the command range nvk_schedule_sources is planning */
+    int run_merged;
     int damage_shader_active;
     VkBuffer damage_buffer;
     uint32_t damage_word_offset;
     uint32_t damage_plane, damage_count;
     int32_t damage_rects[128][4], draw_bounds[4];
+    int32_t damage_union[4]; /* bounds of damage_rects: x0, y0, x1, y1 */
+    unsigned damage_shift;   /* this phase's damage tile */
     int texture_filter, sprite_filter, anisotropy, filter_strength;
     int capture_active, capture_used, capture_eligible;
     int capture_damage_mask;
@@ -381,6 +406,8 @@ static struct {
     uint64_t capture_gpu_runs, capture_gpu_ns[3];
     uint32_t detail_queries, detail_kind[NVK_DETAIL_TS / 2u];
     uint64_t detail_ns[4], detail_runs[4];
+    uint64_t copy_runs[4], copy_bytes[4]; /* base, snapshot, seed, committed */
+    uint64_t copy_elided; /* retired planes already equal to the committed ones */
     uint64_t cpu_ns[NVK_CPU_PHASES], cpu_max[NVK_CPU_PHASES];
     uint64_t gpu_ns[NVK_GPU_PHASES], gpu_max[NVK_GPU_PHASES];
     uint64_t base_gpu_ns, phases_gpu_ns;
@@ -731,8 +758,21 @@ static void nvk_plane_destroy(NvkPlane *p)
     if (p->capture_framebuffer) vkDestroyFramebuffer(vk_core_device(), p->capture_framebuffer, NULL);
     if (p->framebuffer) vkDestroyFramebuffer(vk_core_device(), p->framebuffer, NULL);
     if (p->alpha_view) vkDestroyImageView(vk_core_device(), p->alpha_view, NULL);
+    if (p->copy_color_view) vkDestroyImageView(vk_core_device(), p->copy_color_view, NULL);
+    if (p->copy_alpha_view) vkDestroyImageView(vk_core_device(), p->copy_alpha_view, NULL);
     vk_core_image_destroy(&p->color);
     vk_core_image_destroy(&p->key);
+}
+
+/* Records physical pixels a command may write. Every draw sets its scissor,
+ * so the scissors bound fragment writes; whole-plane writes mark everything. */
+static void nvk_plane_written(NvkPlane *p, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    if (p->written_all || x0 >= x1 || y0 >= y1) return;
+    int32_t *w = p->written;
+    if (w[0] >= w[2]) { w[0] = x0; w[1] = y0; w[2] = x1; w[3] = y1; return; }
+    if (x0 < w[0]) w[0] = x0; if (y0 < w[1]) w[1] = y0;
+    if (x1 > w[2]) w[2] = x1; if (y1 > w[3]) w[3] = y1;
 }
 
 /* GL native_gpu_plane_free. Commands already recorded may still use the
@@ -830,6 +870,7 @@ static int nvk_plane_create(NvkPlane *p, uint32_t width, uint32_t height, int sc
         return 0;
     }
     p->width = width; p->height = height; p->scan = scan;
+    p->written_all = 1;
     p->layout_generation = S.layout_generation;
     p->last_used_work = S.work_sequence;
     p->raster[0] = p->raster[1] = 1.f;
@@ -840,6 +881,16 @@ static int nvk_plane_create(NvkPlane *p, uint32_t width, uint32_t height, int sc
         vi.components.a = VK_COMPONENT_SWIZZLE_R;
         vi.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u };
         if (!nvk_ok(vkCreateImageView(vk_core_device(), &vi, NULL, &p->alpha_view), "vkCreateImageView")) {
+            nvk_plane_destroy(p); memset(p, 0, sizeof(*p));
+            return 0;
+        }
+        vi.image = p->color.image; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.components = (VkComponentMapping){ VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B,
+                                              VK_COMPONENT_SWIZZLE_ONE };
+        const int color_ok = nvk_ok(vkCreateImageView(vk_core_device(), &vi, NULL, &p->copy_color_view), "vkCreateImageView");
+        vi.components = (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO,
+                                              VK_COMPONENT_SWIZZLE_A };
+        if (!color_ok || !nvk_ok(vkCreateImageView(vk_core_device(), &vi, NULL, &p->copy_alpha_view), "vkCreateImageView")) {
             nvk_plane_destroy(p); memset(p, 0, sizeof(*p));
             return 0;
         }
@@ -945,10 +996,16 @@ static void nvk_source_raster(const NvkPlane *source) {
         ? ((float)source->page_pixels - source->page_rows / source->raster[1]) / source->color.height : 0.f;
 }
 
-static int32_t nvk_raster_edge(const NvkPlane *plane, int32_t value, unsigned axis) {
-    const uint32_t origin = axis && plane->page_rows ? R.page_y : 0u;
+/* The first physical pixel whose centre lies at or after a virtual edge, for
+ * draws in the page that begins at virtual row origin. */
+static int32_t nvk_raster_edge_in(const NvkPlane *plane, int32_t value, unsigned axis, uint32_t origin) {
+    if (!axis || !plane->page_rows) origin = 0u;
     const uint32_t pixel = origin ? (origin / plane->page_rows) * plane->page_pixels : 0u;
     return (int32_t)ceil(((double)value - origin) / plane->raster[axis] + pixel - 0.5);
+}
+
+static int32_t nvk_raster_edge(const NvkPlane *plane, int32_t value, unsigned axis) {
+    return nvk_raster_edge_in(plane, value, axis, R.page_y);
 }
 
 /* GL native_gpu_plane_depth: attach (once) and clear-to-far the key. */
@@ -962,6 +1019,7 @@ static int nvk_plane_depth(NvkPlane *p)
     memset(&zero, 0, sizeof(zero));
     vkCmdClearColorImage(R.cmd, p->key.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1u, &range);
     nvk_barrier_all();
+    p->written_all = 1;
     p->has_key = 1;
     p->depth_zero = 1;
     if (p->depth_max) memset(p->depth_max, 0, (size_t)p->depth_columns * p->depth_rows * sizeof(*p->depth_max));
@@ -976,34 +1034,53 @@ static void nvk_plane_barrier_clear(NvkPlane *p)
 }
 
 /* GL native_gpu_blit / native_gpu_blit_depth for a whole plane. */
-static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, int depth);
+static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, int depth, const int32_t *rect);
 
-static void nvk_plane_copy(const NvkPlane *source, NvkPlane *destination, int depth)
+/* rect: physical x0, y0, x1, y1 to copy; NULL copies the whole plane. */
+static void nvk_plane_copy_rect(const NvkPlane *source, NvkPlane *destination, int depth, unsigned site,
+                                const int32_t *rect)
 {
+    ++P.copy_runs[site];
+    P.copy_bytes[site] += rect ? (uint64_t)(rect[2] - rect[0]) * (uint32_t)(rect[3] - rect[1]) * 4u
+                               : (uint64_t)destination->color.width * destination->color.height * 4u;
     const uint32_t query = nvk_detail_begin(0u);
-    nvk_plane_copy_impl(source, destination, depth);
+    nvk_plane_copy_impl(source, destination, depth, rect);
     nvk_detail_end(query);
 }
 
-static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, int depth)
+static void nvk_plane_copy(const NvkPlane *source, NvkPlane *destination, int depth, unsigned site)
 {
-    if (depth) {
-        free(destination->depth_max); destination->depth_max = NULL;
-        destination->depth_zero = source->depth_zero;
-        destination->depth_columns = source->depth_columns; destination->depth_rows = source->depth_rows;
-        destination->depth_scale = source->depth_scale;
-        if (source->depth_max) {
-            const size_t bytes = (size_t)source->depth_columns * source->depth_rows * sizeof(*source->depth_max);
-            destination->depth_max = malloc(bytes);
-            if (destination->depth_max) memcpy(destination->depth_max, source->depth_max, bytes);
-        }
+    nvk_plane_copy_rect(source, destination, depth, site, NULL);
+}
+
+/* The CPU depth bounds that accompany a key copy. */
+static void nvk_plane_copy_depth_bounds(const NvkPlane *source, NvkPlane *destination)
+{
+    free(destination->depth_max); destination->depth_max = NULL;
+    destination->depth_zero = source->depth_zero;
+    destination->depth_columns = source->depth_columns; destination->depth_rows = source->depth_rows;
+    destination->depth_scale = source->depth_scale;
+    if (source->depth_max) {
+        const size_t bytes = (size_t)source->depth_columns * source->depth_rows * sizeof(*source->depth_max);
+        destination->depth_max = malloc(bytes);
+        if (destination->depth_max) memcpy(destination->depth_max, source->depth_max, bytes);
     }
+}
+
+static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, int depth, const int32_t *rect)
+{
+    if (depth) nvk_plane_copy_depth_bounds(source, destination);
     nvk_pass_end();
     VkImageCopy region;
     memset(&region, 0, sizeof(region));
     region.srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
     region.dstSubresource = region.srcSubresource;
     region.extent = (VkExtent3D){ destination->color.width, destination->color.height, 1u };
+    if (rect) {
+        region.srcOffset = region.dstOffset = (VkOffset3D){ rect[0], rect[1], 0 };
+        region.extent = (VkExtent3D){ (uint32_t)(rect[2] - rect[0]), (uint32_t)(rect[3] - rect[1]), 1u };
+        nvk_plane_written(destination, rect[0], rect[1], rect[2], rect[3]);
+    } else destination->written_all = 1;
     vkCmdCopyImage(R.cmd, depth ? source->key.image : source->color.image, VK_IMAGE_LAYOUT_GENERAL,
                    depth ? destination->key.image : destination->color.image, VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
     nvk_barrier_all();
@@ -1377,7 +1454,7 @@ static int nvk_raster_page(NvkPlane *plane, int y)
     return 1;
 }
 
-static void nvk_scissor(const NvkPlane *plane, const int32_t s[4])
+static void nvk_scissor(NvkPlane *plane, const int32_t s[4])
 {
     int32_t x0 = s[0] < 0 ? 0 : s[0], y0 = s[1] < 0 ? 0 : s[1];
     int32_t x1 = s[0] + s[2], y1 = s[1] + s[3];
@@ -1389,6 +1466,7 @@ static void nvk_scissor(const NvkPlane *plane, const int32_t s[4])
     if (x1 > (int32_t)plane->color.width) x1 = plane->color.width;
     if (y1 > (int32_t)plane->color.height) y1 = plane->color.height;
     const int32_t value[4] = { x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0 };
+    nvk_plane_written(plane, x0, y0, x0 + value[2], y0 + value[3]);
     if (R.b.scissor_valid && !memcmp(R.b.scissor, value, sizeof(value))) return;
     const VkRect2D rect = { { value[0], value[1] }, { (uint32_t)value[2], (uint32_t)value[3] } };
     vkCmdSetScissor(R.cmd, 0u, 1u, &rect);
@@ -1493,6 +1571,27 @@ static int nvk_il_bind(const NvkDrawIL *il, const float size[4], const NvkSetKey
 }
 
 /* Draws the pending batch of triangles. */
+/* Interlock draws of the damaged phase plane: the recorded ranges once per
+ * damage rectangle, each inside its own scissor. */
+static void nvk_il_draws(NvkPlane *plane, const int32_t scissor[4], uint32_t first, uint32_t count)
+{
+    if (!R.damage_active || plane != &R.planes[R.damage_plane]) {
+        nvk_scissor(plane, scissor);
+        ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
+        return;
+    }
+    for (uint32_t i = 0u; i < R.damage_count; ++i) {
+        const int32_t *r = R.damage_rects[i];
+        const int x0 = scissor[0] > r[0] ? scissor[0] : r[0], y0 = scissor[1] > r[1] ? scissor[1] : r[1];
+        const int x1 = scissor[0] + scissor[2] < r[0] + r[2] ? scissor[0] + scissor[2] : r[0] + r[2];
+        const int y1 = scissor[1] + scissor[3] < r[1] + r[3] ? scissor[1] + scissor[3] : r[1] + r[3];
+        if (x0 >= x1 || y0 >= y1) continue;
+        const int32_t clipped[4] = { x0, y0, x1 - x0, y1 - y0 };
+        nvk_scissor(plane, clipped);
+        ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
+    }
+}
+
 static int nvk_il_flush(void)
 {
     if (!IB.draw_count) return 1;
@@ -1525,13 +1624,12 @@ static int nvk_il_flush(void)
         vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &IB.vbuf, &IB.voff);
         R.b.vbuf = IB.vbuf; R.b.voff = IB.voff;
     }
-    nvk_scissor(IB.plane, IB.scissor);
     /* Adjacent triangle ranges are one draw. */
     for (uint32_t d = 0u; d < draw_count;) {
         const uint32_t first = IB.first[d];
         uint32_t count = IB.count[d++];
         while (d < draw_count && IB.first[d] == first + count) count += IB.count[d++];
-        ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
+        nvk_il_draws(IB.plane, IB.scissor, first, count);
     }
     return 1;
 }
@@ -1900,6 +1998,18 @@ static int nvk_clear_span(NvkPlane *plane, const GlNativeGpuCommand *command, un
             if (y1 > r[1] + r[3]) y1 = r[1] + r[3];
         }
         if (x0 >= x1 || y0 >= y1) continue;
+        if (R.work->render_width) {
+            /* A host-grid plane: the pixel centres the span's quad covers,
+             * in the page that holds it, as nvk_scissor maps them. */
+            if (!nvk_raster_page(plane, y0)) return 0;
+            x0 = nvk_raster_edge(plane, x0, 0u); y0 = nvk_raster_edge(plane, y0, 1u);
+            x1 = nvk_raster_edge(plane, x1, 0u); y1 = nvk_raster_edge(plane, y1, 1u);
+            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+            if (x1 > (int)plane->color.width) x1 = (int)plane->color.width;
+            if (y1 > (int)plane->color.height) y1 = (int)plane->color.height;
+            if (x0 >= x1 || y0 >= y1) continue;
+        }
+        nvk_plane_written(plane, x0, y0, x1, y1);
         rects[count++] = (VkClearRect){
             .rect = { { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } },
             .baseArrayLayer = 0u, .layerCount = 1u,
@@ -1925,9 +2035,28 @@ static int nvk_clear_span(NvkPlane *plane, const GlNativeGpuCommand *command, un
 
 static int nvk_draw(NvkPlane *plane, int key_attached, const int32_t scissor[4], uint32_t first, uint32_t count)
 {
-    if (!R.damage_active || plane != &R.planes[R.damage_plane] || (R.capture_active && R.capture_damage_mask) ||
-        (R.damage_shader_active && R.batchable && count == 3u))
+    if (!R.damage_active || plane != &R.planes[R.damage_plane] || (R.capture_active && R.capture_damage_mask))
         return nvk_draw_region(plane, key_attached, scissor, first, count);
+    if (S.interlock && R.batchable) {
+        /* The batch flush replays its ranges in every damage rectangle. */
+        const int32_t *u = R.damage_union;
+        const int x0 = scissor[0] > u[0] ? scissor[0] : u[0], y0 = scissor[1] > u[1] ? scissor[1] : u[1];
+        const int x1 = scissor[0] + scissor[2] < u[2] ? scissor[0] + scissor[2] : u[2];
+        const int y1 = scissor[1] + scissor[3] < u[3] ? scissor[1] + scissor[3] : u[3];
+        if (x0 >= x1 || y0 >= y1) return 1;
+        return nvk_draw_region(plane, key_attached, scissor, first, count);
+    }
+    if (R.damage_shader_active && R.batchable && count == 3u) {
+        /* The shader rejects undamaged tiles; the scissor keeps the
+         * rasterizer inside their bounds. */
+        const int32_t *u = R.damage_union;
+        const int x0 = scissor[0] > u[0] ? scissor[0] : u[0], y0 = scissor[1] > u[1] ? scissor[1] : u[1];
+        const int x1 = scissor[0] + scissor[2] < u[2] ? scissor[0] + scissor[2] : u[2];
+        const int y1 = scissor[1] + scissor[3] < u[3] ? scissor[1] + scissor[3] : u[3];
+        if (x0 >= x1 || y0 >= y1) return 1;
+        const int32_t clipped[4] = { x0, y0, x1 - x0, y1 - y0 };
+        return nvk_draw_region(plane, key_attached, clipped, first, count);
+    }
     const uint32_t begin = R.damage_region >= 0 ? (uint32_t)R.damage_region : 0u;
     const uint32_t end = R.damage_region >= 0 ? begin + 1u : R.damage_count;
     for (uint32_t i = begin; i < end; ++i) {
@@ -1946,6 +2075,15 @@ static int nvk_draw(NvkPlane *plane, int key_attached, const int32_t scissor[4],
 
 /* ---- target preparation (GL native_gpu_target, core tier) ------------------------------------------------- */
 static int32_t s_scissor_value[4];
+
+/* Overlap tests evaluate the pixel centres this plane rasterizes. */
+static void nvk_hz_grid(const NvkPlane *plane)
+{
+    NativeHzGrid *g = &g_native_hz_grid;
+    g->active = plane->page_rows || plane->raster[0] != 1.f || plane->raster[1] != 1.f;
+    g->sx = 1.0 / plane->raster[0]; g->sy = 1.0 / plane->raster[1];
+    g->page_rows = plane->page_rows; g->page_pixels = plane->page_pixels;
+}
 
 static int nvk_target(NvkPlane *plane, uint32_t scale, int x, int y, int w, int h, int read_destination,
                       unsigned depth, const int *draw_scissor,
@@ -1976,8 +2114,10 @@ static int nvk_target(NvkPlane *plane, uint32_t scale, int x, int y, int w, int 
     }
     if (!S.interlock && (read_destination || read_depth)) {
         int hazard = plane->dirty_all || shape_unknown;
+        nvk_hz_grid(plane);
         for (uint32_t i = 0; !hazard && i < shape_count; ++i)
             hazard = native_gpu_hazard_hit(plane->width, plane->height, plane->hazards, &shapes[i], scale);
+        g_native_hz_grid.active = 0;
         if (R.scheduled_run) {
             /* nvk_schedule_run placed the barriers. */
         } else if (hazard) {
@@ -2556,8 +2696,10 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
     R.key.src_key = copy_depth ? source_plane->key.view : S.dummy_uint.view;
     if (!nvk_target(plane, scale, command->x, command->y, command->w, command->h, (command->mask & 2u) != 0,
                     depth, NULL, NULL, 0, 0.f)) return 0;
-    if (!work->render_width && S.clear_spans && !S.interlock && !R.capture_active && !wire && !work->depth_view &&
-        command->kind == NATIVE_GPU_SPAN && command->source == UINT32_MAX && !(command->mask & 2u))
+    if (S.clear_spans && !S.interlock && !R.capture_active && !wire && !work->depth_view &&
+        command->kind == NATIVE_GPU_SPAN && command->source == UINT32_MAX && !(command->mask & 2u) &&
+        (!work->render_width || !plane->page_rows ||
+            R.draw_bounds[1] / plane->page_rows == (R.draw_bounds[3] - 1) / plane->page_rows))
         return nvk_clear_span(plane, command, depth);
     /* Guest pixels are black in wireframe; copies between VIEW planes keep
      * the previously drawn edges, just as on the GL debug path. */
@@ -2589,16 +2731,28 @@ static int nvk_render_command(const GlNativeGpuCommand *command, const uint8_t *
 
 /* ---- layer scheduling (GL native_gpu_schedule_run) -------------------------------------------------------------- */
 typedef struct NvkSchedCommand { uint32_t base, vertex; uint16_t lo, hi; const GlNativeGpuDrawGeometry *prepared; } NvkSchedCommand;
-static NvkSchedCommand s_sched_cmd[NATIVE_SCHED_CMDS];
-static uint16_t *s_sched_max_layer;
-static uint32_t s_sched_max_capacity;
+static _Thread_local NvkSchedCommand s_sched_cmd[NATIVE_SCHED_CMDS];
+/* One command of a scheduled run: its own data blob and vertices. A run may
+ * mix slice draws with phase template draws; vsrc picks the vertex buffer
+ * (0 the bound one, 1 the slice's, 2 the templates'). */
+typedef struct NvkSchedSource {
+    const GlNativeGpuCommand *command;
+    const uint8_t *data;
+    const float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOATS];
+    uint32_t vertex;
+    const GlNativeGpuDrawGeometry *prepared;
+    uint32_t vsrc;
+} NvkSchedSource;
+static _Thread_local NvkSchedSource s_sched_src[NATIVE_SCHED_CMDS];
+static _Thread_local uint16_t *s_sched_max_layer;
+static _Thread_local uint32_t s_sched_max_capacity;
 static uint32_t *s_sched_emission;
 static uint32_t s_sched_emission_capacity;
 typedef struct NvkMaterialOrder { uint64_t key, hd_key; uint32_t command, triangle; } NvkMaterialOrder;
 static NvkMaterialOrder *s_sched_order;
 static uint32_t s_sched_order_capacity;
-static uint8_t *s_sched_depth_fast;
-static uint32_t s_sched_depth_capacity;
+static _Thread_local uint8_t *s_sched_depth_fast;
+static _Thread_local uint32_t s_sched_depth_capacity;
 static int nvk_material_order_compare(const void *left, const void *right)
 {
     const NvkMaterialOrder *a = left, *b = right;
@@ -2722,6 +2876,7 @@ static int nvk_capture_bind(NvkPlane *plane, uint32_t scale, const int32_t rect[
 
 static int nvk_capture_begin(NvkPlane *plane, uint32_t scale, int x, int y, uint32_t width, uint32_t height)
 {
+    plane->written_all = 1; /* resolved by compute, in capture coordinates */
     P.capture_full_pixels += (uint64_t)width * height;
     const char *clip = getenv("PSX_NATIVE_VK_CAPTURE_DAMAGE_BOUNDS");
     if (clip && clip[0] == '1' && S.linked_capture && R.damage_active &&
@@ -2916,10 +3071,7 @@ static int nvk_capture_run(unsigned plane_index, const GlNativeGpuCommand *comma
 }
 
 /* 1 rendered, 0 failed, -1 not applicable (nothing was drawn). */
-static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand *commands, uint32_t first, uint32_t end,
-                            uint32_t first_vertex, const uint8_t *captured_data,
-                             const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
-                             const GlNativeGpuGeometry *geometry, NvkScheduleCache *cached, int optimize_depth);
+static int nvk_schedule_sources(unsigned plane_index, uint32_t ncmd, NvkScheduleCache *cached, int optimize_depth);
 
 static int nvk_schedule_run(unsigned plane_index, const GlNativeGpuCommand *commands, uint32_t first, uint32_t end,
                             uint32_t first_vertex, const uint8_t *captured_data,
@@ -2930,58 +3082,84 @@ static int nvk_schedule_run(unsigned plane_index, const GlNativeGpuCommand *comm
     if (P.capture_profile)
         for (uint32_t i = first; i < end; ++i) if (commands[i].draw.hd_texture.valid) { kind = 3u; break; }
     const uint32_t query = nvk_detail_begin(kind);
-    const int result = nvk_schedule_run_impl(plane_index, commands, first, end, first_vertex, captured_data, slice_vertices, geometry, cached, optimize_depth);
+    int result = -1;
+    if (S.interlock || R.work->wireframe) goto done;   /* debug edges keep command order */
+    if (R.capture_active) {
+        uint32_t vertex = first_vertex;
+        result = 1;
+        for (uint32_t i = first; i < end && result; ++i) {
+            if (commands[i].plane == plane_index)
+                result = nvk_render_command(&commands[i], captured_data, vertex, slice_vertices,
+                    geometry && geometry->primitives ? geometry->primitives + geometry->offsets[i].primitive : NULL);
+            vertex += native_gpu_command_vertex_count(&commands[i]);
+        }
+        goto done;
+    }
+    if (!slice_vertices || end - first > NATIVE_SCHED_CMDS) goto done;
+    uint32_t ncmd = 0u, total = 0u, vertex = first_vertex;
+    for (uint32_t d = first; d < end; ++d) {
+        const GlNativeGpuCommand *command = &commands[d];
+        if (command->plane == plane_index) {
+            s_sched_src[ncmd++] = (NvkSchedSource){ .command = command, .data = captured_data, .vertices = slice_vertices,
+                .vertex = vertex, .prepared = geometry && geometry->primitives ? geometry->primitives + geometry->offsets[d].primitive : NULL };
+            total += command->draw.topology == GPU_RENDER_SEMANTIC_LINES ? command->draw.line_count : native_gpu_command_triangles(command);
+        }
+        vertex += native_gpu_command_vertex_count(command);
+    }
+    if (!total) { result = 1; goto done; }
+    if (total <= NATIVE_SCHED_PRIMS && R.planes[plane_index].color.image) {
+        result = nvk_capture_run(plane_index, commands, first, end, first_vertex, captured_data, slice_vertices, geometry, total);
+        if (result >= 0) goto done;
+    }
+    nvk_hz_grid(&R.planes[plane_index]);
+    R.run_first = first; R.run_end = end; R.run_merged = 0;
+    result = nvk_schedule_sources(plane_index, ncmd, cached, optimize_depth);
+    g_native_hz_grid.active = 0;
+done:
     nvk_detail_end(query);
     return result;
 }
 
-static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand *commands, uint32_t first, uint32_t end,
-                            uint32_t first_vertex, const uint8_t *captured_data,
-                             const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
-                             const GlNativeGpuGeometry *geometry, NvkScheduleCache *cached, int optimize_depth)
+/* A primitive's bounds against the phase damage; NULL damage: all visible. */
+static int nvk_plan_visible(const int32_t (*damage)[4], uint32_t count, int left, int top, int right, int bottom)
 {
-    if (S.interlock || R.work->wireframe) return -1;   /* debug edges keep command order */
-    if (R.capture_active) {
-        uint32_t vertex = first_vertex;
-        int ok = 1;
-        for (uint32_t i = first; i < end && ok; ++i) {
-            if (commands[i].plane == plane_index)
-                ok = nvk_render_command(&commands[i], captured_data, vertex, slice_vertices,
-                    geometry && geometry->primitives ? geometry->primitives + geometry->offsets[i].primitive : NULL);
-            vertex += native_gpu_command_vertex_count(&commands[i]);
-        }
-        return ok;
+    if (!damage) return 1;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const int32_t *r = damage[i];
+        if (left < r[0] + r[2] && right > r[0] && top < r[1] + r[3] && bottom > r[1]) return 1;
     }
-    const GlNativeGpuWork *work = R.work;
-    NvkPlane *plane = &R.planes[plane_index];
-    const uint32_t scale = native_gpu_plane_scale(work, plane_index);
-    NativeSchedState *sched = &s_sched; /* native_sched_query reads this global; GL runs on this thread too */
-    if (!slice_vertices || !plane->color.image || !scale || end - first > NATIVE_SCHED_CMDS) return -1;
+    return 0;
+}
+
+typedef struct NvkPlanResult { uint32_t total, prim_count, shape_count, run_max; } NvkPlanResult;
+
+/* Plans the layers of s_sched_src[0, ncmd) on one plane into this thread's
+ * scheduler state. Reads no executor state beyond the arguments, so the phase
+ * planner runs it ahead of recording. -1 failed, 1 nothing to draw, 2 planned. */
+static int nvk_schedule_plan(const GlNativeGpuWork *work, NvkPlane *plane, uint32_t scale, uint32_t ncmd,
+                             NvkScheduleCache *cached, int optimize_depth, const int32_t (*damage)[4],
+                             uint32_t damage_count, NvkPlanResult *out)
+{
+    const NvkSchedSource *src = s_sched_src;
+    NativeSchedState *sched = &s_sched; /* thread-local: native_sched_query reads it */
+    if (!plane->color.image || !scale || ncmd > NATIVE_SCHED_CMDS) return -1;
     const uint32_t cell_size = NATIVE_SCHED_CELL * scale;
     const uint32_t columns = (plane->width + cell_size - 1u) / cell_size;
     const uint32_t rows = (plane->height + cell_size - 1u) / cell_size;
     if (!columns || !rows || columns * rows > 1u << 20) return -1;
-    uint32_t total = 0u, ncmd = 0u, vertex = first_vertex;
-    uint32_t command_indices[NATIVE_SCHED_CMDS];
+    uint32_t total = 0u;
     int need_geo = 0;
-    for (uint32_t d = first; d < end; ++d) {
-        const GlNativeGpuCommand *command = &commands[d];
-        if (command->plane == plane_index) {
-            command_indices[ncmd] = d;
-            const uint32_t n = command->draw.topology == GPU_RENDER_SEMANTIC_LINES ? command->draw.line_count : native_gpu_command_triangles(command);
-            s_sched_cmd[ncmd].base = total; s_sched_cmd[ncmd].vertex = vertex;
-            s_sched_cmd[ncmd].lo = NATIVE_SCHED_NONE; s_sched_cmd[ncmd].hi = 0u;
-            s_sched_cmd[ncmd].prepared = geometry && geometry->primitives ? geometry->primitives + geometry->offsets[d].primitive : NULL;
-            need_geo |= !s_sched_cmd[ncmd].prepared;
-            total += n; ++ncmd;
-        }
-        vertex += native_gpu_command_vertex_count(command);
+    for (uint32_t ci = 0; ci < ncmd; ++ci) {
+        const GlNativeGpuCommand *command = src[ci].command;
+        const uint32_t n = command->draw.topology == GPU_RENDER_SEMANTIC_LINES ? command->draw.line_count : native_gpu_command_triangles(command);
+        s_sched_cmd[ci].base = total; s_sched_cmd[ci].vertex = src[ci].vertex;
+        s_sched_cmd[ci].lo = NATIVE_SCHED_NONE; s_sched_cmd[ci].hi = 0u;
+        s_sched_cmd[ci].prepared = src[ci].prepared;
+        need_geo |= !src[ci].prepared;
+        total += n;
     }
     if (!total) return 1;
     if (total > NATIVE_SCHED_PRIMS) return -1;
-    const int captured = nvk_capture_run(plane_index, commands, first, end, first_vertex, captured_data,
-                                        slice_vertices, geometry, total);
-    if (captured >= 0) return captured;
     if (!nvk_sched_reserve((void **)&s_sched_depth_fast, &s_sched_depth_capacity, total, sizeof(*s_sched_depth_fast))) return -1;
     memset(s_sched_depth_fast, 0, total * sizeof(*s_sched_depth_fast));
     const uint32_t cells = columns * rows;
@@ -3016,11 +3194,12 @@ static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand 
         memcpy(sched->layer, cached->layers, (size_t)total * sizeof(*sched->layer));
         memcpy(s_sched_cmd, cached->commands, (size_t)ncmd * sizeof(*s_sched_cmd));
         ++s_template_schedule_hits;
-        goto plan_ready;
+        goto planned;
     }
-    for (uint32_t d = first, ci = 0u; d < end && !failed; ++d) {
-        const GlNativeGpuCommand *command = &commands[d];
-        if (command->plane != plane_index) continue;
+    for (uint32_t ci = 0u; ci < ncmd && !failed; ++ci) {
+        const GlNativeGpuCommand *command = src[ci].command;
+        const uint8_t *captured_data = src[ci].data;
+        const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS] = src[ci].vertices;
         const XgSemanticDrawRecord *draw = &command->draw;
         const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
         const uint32_t per = lines ? 6u : 3u, vstart = s_sched_cmd[ci].vertex;
@@ -3051,14 +3230,15 @@ static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand 
             }
             sched->layer[p] = NATIVE_SCHED_NONE;
             if (!g->visible) continue;
-            if (!nvk_damage_intersects(g->left * (int)scale, g->top * (int)scale,
+            if (!nvk_plan_visible(damage, damage_count, g->left * (int)scale, g->top * (int)scale,
                     (g->right + 1) * (int)scale, (g->bottom + 1) * (int)scale)) continue;
             GlNativeSchedPrim *pr = &sched->prim[prim_count++];
             pr->shape = shape_count; pr->count = 0u; pr->unknown = 0u;
-            const int fast_depth = optimize_depth && command->plane != 0u && nvk_depth_bounds_draw(plane, scale, g);
+            const int fast_depth = optimize_depth && src[ci].vsrc != 2u && command->plane != 0u && nvk_depth_bounds_draw(plane, scale, g);
             s_sched_depth_fast[p] = fast_depth != 0;
             pr->reads = (m->semi_transparent || m->mask_check ||
-                (nvk_depth_reads(plane, &g->depth, command->plane != 0u) && (!fast_depth || g->depth.semi))) != 0;
+                (work->depth_test && plane->has_key && command->plane != 0u && (g->depth.test || g->depth.semi) &&
+                 (!fast_depth || g->depth.semi))) != 0;
             for (uint32_t k = 0; k < per / 3u; ++k) {
                 const float (*v)[GL_NATIVE_GPU_VERTEX_FLOATS] = slice_vertices + vstart + t * per + k * 3u;
                 const int r = native_gpu_shape_tri(&sched->shape[shape_count], v[0], v[1], v[2], offset, scale);
@@ -3100,7 +3280,6 @@ static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand 
                     }
             }
         }
-        ++ci;
     }
     for (uint32_t i = 0; i < touched; ++i) sched->cell_head[sched->touched[i]] = -1;
     if (failed) return -1;
@@ -3123,7 +3302,28 @@ static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand 
             cached->valid = -1;
         }
     }
-plan_ready: ;
+planned:
+    *out = (NvkPlanResult){ .total = total, .prim_count = prim_count, .shape_count = shape_count, .run_max = run_max };
+    return 2;
+}
+
+static int nvk_preplan_take(unsigned plane_index, uint32_t ncmd, NvkPlanResult *out);
+
+/* Schedules s_sched_src[0, ncmd), all drawing on one plane, in FIFO order. */
+static int nvk_schedule_sources(unsigned plane_index, uint32_t ncmd, NvkScheduleCache *cached, int optimize_depth)
+{
+    const NvkSchedSource *src = s_sched_src;
+    const GlNativeGpuWork *work = R.work;
+    NvkPlane *plane = &R.planes[plane_index];
+    const uint32_t scale = native_gpu_plane_scale(work, plane_index);
+    NativeSchedState *sched = &s_sched;
+    NvkPlanResult plan;
+    int planned = cached ? 0 : nvk_preplan_take(plane_index, ncmd, &plan);
+    if (!planned)
+        planned = nvk_schedule_plan(work, plane, scale, ncmd, cached, optimize_depth,
+            R.damage_active ? (const int32_t (*)[4])R.damage_rects : NULL, R.damage_count, &plan);
+    if (planned != 2) return planned;
+    const uint32_t total = plan.total, prim_count = plan.prim_count, run_max = plan.run_max;
     /* Stable counting-sort by layer, then command/triangle FIFO. Emit each
      * selected primitive once instead of rescanning every mesh for every
      * layer. Damage rectangles can then be grouped without multiplying that
@@ -3157,11 +3357,11 @@ plan_ready: ;
                                               total, sizeof(*s_sched_order))) {
         for (uint32_t at = 0u; at < offsets[run_max + 1u]; ++at) {
             const uint32_t ci = emit_command[at], t = emit_triangle[at];
-            const GlNativeGpuCommand *command = &commands[command_indices[ci]];
+            const GlNativeGpuCommand *command = src[ci].command;
             const GpuRenderHdTexture *hd = &command->draw.hd_texture;
             if (command->source || (hd->valid && !S.sort_hd_readers)) emit_reads[at] = 0u;
             const GlNativeTextureState texture = command->mesh_count
-                ? ((const GlNativeGpuMeshTriangle *)(const void *)(captured_data + command->data))[t].texture
+                ? ((const GlNativeGpuMeshTriangle *)(const void *)(src[ci].data + command->data))[t].texture
                 : native_texture_state(&command->draw.primitive.material);
             const GlNativeGpuDrawGeometry *g = s_sched_cmd[ci].prepared ? &s_sched_cmd[ci].prepared[t]
                 : &sched->geo[s_sched_cmd[ci].base + t];
@@ -3200,6 +3400,9 @@ plan_ready: ;
             pre = native_gpu_hazard_hit(plane->width, plane->height, plane->hazards, &sched->shape[pr->shape + k], scale);
     }
     int ok = 1;
+    /* Vertex buffers of a mixed run, swapped in per command. */
+    NvkVertexSource slice_source = R.vsrc, *vsrc_owner[3] = { NULL, &slice_source, &R.template_vsrc };
+    uint32_t bound_vsrc = 1u;
     R.scheduled_run = 1;
     nvk_pass_begin(plane);
     for (uint32_t layer = 0; layer <= run_max && ok; ++layer) {
@@ -3223,13 +3426,23 @@ plan_ready: ;
                     visible = g->visible && nvk_damage_intersects(g->left * (int)scale, g->top * (int)scale,
                         (g->right + 1) * (int)scale, (g->bottom + 1) * (int)scale);
                 }
-                if (visible) ok = nvk_render_layer(&commands[command_indices[ci]], captured_data,
-                    s_sched_cmd[ci].vertex, slice_vertices, prepared, NULL, 0u,
+                if (visible && src[ci].vsrc && src[ci].vsrc != bound_vsrc) {
+                    *vsrc_owner[bound_vsrc] = R.vsrc;
+                    R.vsrc = *vsrc_owner[bound_vsrc = src[ci].vsrc];
+                    R.b.vbuf = VK_NULL_HANDLE;
+                }
+                if (visible) ok = nvk_render_layer(src[ci].command, src[ci].data,
+                    s_sched_cmd[ci].vertex, src[ci].vertices, prepared, NULL, 0u,
                     emit_triangle + begin, at - begin, s_sched_depth_fast + s_sched_cmd[ci].base);
             }
         }
     }
     if (!nvk_core_batch_flush()) ok = 0;
+    if (bound_vsrc != 1u) {
+        *vsrc_owner[bound_vsrc] = R.vsrc;
+        R.vsrc = slice_source;
+        R.b.vbuf = VK_NULL_HANDLE;
+    }
     R.damage_region = -1;
     R.scheduled_run = 0;
     R.c.scheduled_layers += run_max + 1u;
@@ -3636,12 +3849,11 @@ static int nvk_template_render(const GlNativeGpuCommand *command)
         vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &R.vsrc.buf, &R.vsrc.off);
         R.b.vbuf = R.vsrc.buf; R.b.voff = R.vsrc.off;
     }
-    nvk_scissor(plane, s_scissor_value);
     for (uint32_t t = 0u; t < info->count;) {
         if (!plan->visible[info->first + t]) { ++t; continue; }
         const uint32_t first = t++;
         while (t < info->count && plan->visible[info->first + t]) ++t;
-        ++P.draw_calls; vkCmdDraw(R.cmd, (t - first) * 3u, 1u, (info->first + first) * 3u, 0u);
+        nvk_il_draws(plane, s_scissor_value, (info->first + first) * 3u, (t - first) * 3u);
         ++R.since_submit;
     }
     R.c.geometry_draws += info->visible;
@@ -3704,6 +3916,63 @@ static uint32_t nvk_capture_group(const GlNativeGpuCommand *commands, uint32_t f
     return end;
 }
 
+/* End of the mixed TEMPLATE/DRAW run of one plane starting at first, or first
+ * when it holds a single kind (the per-kind paths cover those). */
+static uint32_t nvk_merge_end(const GlNativeGpuCommand *commands, uint32_t first, uint32_t limit)
+{
+    const GlNativePhaseTemplates *cache = R.work->phase_templates;
+    const uint32_t plane = commands[first].plane;
+    int kinds = 0;
+    uint32_t end = first;
+    if (!R.plan_attempted && commands[first].kind == NATIVE_GPU_TEMPLATE) nvk_template_prepare(plane);
+    if (R.plan) return first;
+    for (; end < limit && end - first < NATIVE_SCHED_CMDS; ++end) {
+        const GlNativeGpuCommand *c = &commands[end];
+        if (c->plane != plane) break;
+        if (c->kind == NATIVE_GPU_TEMPLATE) {
+            if (!cache || c->data >= cache->count) break;
+            kinds |= 1;
+        } else if (c->kind == NATIVE_GPU_DRAW) kinds |= 2;
+        else break;
+    }
+    return kinds == 3 ? end : first;
+}
+
+static int nvk_schedule_merged(const GlNativeGpuCommand *commands, const uint8_t *captured_data,
+                               const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
+                               const GlNativeGpuGeometry *geometry, uint32_t first, uint32_t end, uint32_t first_vertex)
+{
+    static GlNativeGpuCommand *copies;
+    static uint32_t capacity;
+    const GlNativePhaseTemplates *cache = R.work->phase_templates;
+    const unsigned plane = commands[first].plane;
+    if (!slice_vertices || !nvk_sched_reserve((void **)&copies, &capacity, end - first, sizeof(*copies))) return -1;
+    uint32_t ncmd = 0u, vertex = first_vertex;
+    for (uint32_t d = first; d < end; ++d) {
+        const GlNativeGpuCommand *command = &commands[d];
+        if (command->kind == NATIVE_GPU_TEMPLATE) {
+            const GlNativeGpuGeometry *g = cache->geometry;
+            copies[d - first] = cache->commands[command->data];
+            copies[d - first].plane = plane;
+            s_sched_src[ncmd++] = (NvkSchedSource){ .command = &copies[d - first], .data = cache->data, .vertices = g->vertices,
+                .vertex = g->offsets[command->data].vertex,
+                .prepared = g->primitives ? g->primitives + g->offsets[command->data].primitive : NULL, .vsrc = 2u };
+        } else {
+            s_sched_src[ncmd++] = (NvkSchedSource){ .command = command, .data = captured_data, .vertices = slice_vertices,
+                .vertex = vertex, .prepared = geometry && geometry->primitives ? geometry->primitives + geometry->offsets[d].primitive : NULL,
+                .vsrc = 1u };
+        }
+        vertex += native_gpu_command_vertex_count(command);
+    }
+    const uint32_t query = nvk_detail_begin(1u);
+    nvk_hz_grid(&R.planes[plane]);
+    R.run_first = first; R.run_end = end; R.run_merged = 1;
+    const int result = nvk_schedule_sources(plane, ncmd, NULL, 1);
+    g_native_hz_grid.active = 0;
+    nvk_detail_end(query);
+    return result;
+}
+
 static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured_data, uint32_t cursor,
                      uint32_t command_limit, const GlNativeGpuGeometry *geometry)
 {
@@ -3755,6 +4024,24 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
             for (uint32_t j = i; j < capture_end; ++j) first_vertex += native_gpu_command_vertex_count(&commands[j]);
             i = capture_end - 1u;
             continue;
+        }
+        if (S.merge_runs && !R.capture_active && !S.interlock && !work->wireframe &&
+            (command->kind == NATIVE_GPU_TEMPLATE || command->kind == NATIVE_GPU_DRAW)) {
+            /* Template and slice draws of one plane, scheduled as one run:
+             * independent objects then share layers, and so barriers. */
+            const uint32_t end = nvk_merge_end(commands, i, command_limit);
+            if (end > i) {
+                const int scheduled = nvk_schedule_merged(commands, captured_data, slice_vertices, geometry,
+                                                          i, end, command_first_vertex);
+                if (scheduled >= 0) {
+                    ok = scheduled;
+                    for (uint32_t j = i + 1u; j < end; ++j) first_vertex += native_gpu_command_vertex_count(&commands[j]);
+                    template_vertices_bound = -1;
+                    i = end - 1u;
+                    if (!ok) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_COMMAND, i, command->kind);
+                    continue;
+                }
+            }
         }
         if (command->kind == NATIVE_GPU_TEMPLATE) {
             const GlNativePhaseTemplates *cache = work->phase_templates;
@@ -3835,10 +4122,10 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
             if (source && source->color.image && command->source < GL_NATIVE_VIEW_TARGET_CAPACITY) {
                 NvkPlane *base = &S.bases[command->source];
                 ok = nvk_clone_plane_size(base, source);
-                if (ok) nvk_plane_copy(source, base, 0);
+                if (ok) nvk_plane_copy(source, base, 0, 0u);
                 if (ok && source->has_key) {
                     ok = nvk_plane_depth(base);
-                    if (ok) nvk_plane_copy(source, base, 1);
+                    if (ok) nvk_plane_copy(source, base, 1, 0u);
                 }
             }
         } else if (command->kind == NATIVE_GPU_SNAPSHOT) {
@@ -3851,10 +4138,10 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
                         memset(&S.spare_snapshots[j], 0, sizeof(S.spare_snapshots[j]));
                     }
                     ok = nvk_clone_plane_size(&R.snapshots[j], &R.planes[j]);
-                    if (ok) nvk_plane_copy(&R.planes[j], &R.snapshots[j], 0);
+                    if (ok) nvk_plane_copy(&R.planes[j], &R.snapshots[j], 0, 1u);
                     if (ok && R.planes[j].has_key) {
                         ok = nvk_plane_depth(&R.snapshots[j]);
-                        if (ok) nvk_plane_copy(&R.planes[j], &R.snapshots[j], 1);
+                        if (ok) nvk_plane_copy(&R.planes[j], &R.snapshots[j], 1, 1u);
                     }
                 }
         } else if (command->kind == NATIVE_GPU_DRAW) {
@@ -3899,6 +4186,64 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
 /* ---- scanout (GL native_gpu_scanout_*) ---------------------------------------------------------------------------------------- */
 static int nvk_scanout_image_impl(unsigned image);
 
+/* A phase image whose spans all map one source pixel to one output pixel is
+ * a plain copy: colour and class byte (alpha) move together, and the copy
+ * views present them as the raster resolve would have written them. 1
+ * copied, 0 failed, -1 not a 1:1 mapping. */
+static int nvk_scanout_copy(unsigned image, NvkPlane *output, float output_scale_x, float output_scale_y)
+{
+    const GlNativeGpuWork *work = R.work;
+    const NvkPlane *input = &R.planes[GL_NATIVE_GPU_PHASE_BASE + image - 1u];
+    const unsigned source_scale = native_gpu_plane_scale(work, GL_NATIVE_GPU_PHASE_BASE + image - 1u);
+    if (!input->color.image || !source_scale || !output->copy_color_view) return -1;
+    const float source_scale_x = source_scale / input->raster[0], source_scale_y = source_scale / input->raster[1];
+    if (source_scale_x != output_scale_x || source_scale_y != output_scale_y) return -1;
+    VkImageCopy regions[64];
+    uint32_t count = 0u;
+    const uint32_t output_width = output->width, output_height = output->height;
+    for (unsigned y = 0; y < work->scanout_height;) {
+        const unsigned sy = y + work->phase_crop_y;
+        unsigned rows = 1u;
+        while (y + rows < work->scanout_height &&
+            (!input->page_rows || (sy + rows) * source_scale / input->page_rows == sy * source_scale / input->page_rows)) ++rows;
+        for (unsigned x = 0; x < work->scanout_width;) {
+            const unsigned source_width = input->width / source_scale;
+            const unsigned sx = (x + work->phase_crop_x) % source_width;
+            const unsigned span = work->scanout_width - x > source_width - sx ? source_width - sx : work->scanout_width - x;
+            const uint32_t virtual_y = sy * source_scale;
+            const uint32_t page = input->page_rows ? virtual_y / input->page_rows : 0u;
+            const float physical_y = page * input->page_pixels + (virtual_y - page * input->page_rows) / input->raster[1];
+            /* nvk_scanout_image_impl's mapping; the resolve fetches
+             * floor(output + 0.5 + mapping) for each output pixel. */
+            const float map_x = sx * source_scale_x + input->raster[2] - x * source_scale_x;
+            const float map_y = physical_y - y * source_scale_y;
+            const int32_t shift_x = (int32_t)floorf(map_x + 0.5f), shift_y = (int32_t)floorf(map_y + 0.5f);
+            const int32_t x0 = (int32_t)native_resolution_edge(x, work->scanout_width, output_width);
+            const int32_t y0 = (int32_t)native_resolution_edge(y, work->scanout_height, output_height);
+            const int32_t x1 = (int32_t)native_resolution_edge(x + span, work->scanout_width, output_width);
+            const int32_t y1 = (int32_t)native_resolution_edge(y + rows, work->scanout_height, output_height);
+            if (x1 > x0 && y1 > y0) {
+                if (count == sizeof(regions) / sizeof(regions[0]) || x0 + shift_x < 0 || y0 + shift_y < 0 ||
+                    x1 + shift_x > (int32_t)input->color.width || y1 + shift_y > (int32_t)input->color.height) return -1;
+                VkImageCopy *r = &regions[count++];
+                memset(r, 0, sizeof(*r));
+                r->srcSubresource = r->dstSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+                r->srcOffset = (VkOffset3D){ x0 + shift_x, y0 + shift_y, 0 };
+                r->dstOffset = (VkOffset3D){ x0, y0, 0 };
+                r->extent = (VkExtent3D){ (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1u };
+            }
+            x += span;
+        }
+        y += rows;
+    }
+    nvk_pass_end();
+    if (count) vkCmdCopyImage(R.cmd, input->color.image, VK_IMAGE_LAYOUT_GENERAL, output->color.image,
+                              VK_IMAGE_LAYOUT_GENERAL, count, regions);
+    nvk_barrier_all();
+    output->copied = 1;
+    return 1;
+}
+
 static int nvk_scanout_image(unsigned image)
 {
     const uint32_t query = nvk_detail_begin(2u);
@@ -3920,6 +4265,11 @@ static int nvk_scanout_image_impl(unsigned image)
         nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_SCANOUT, image, 0u);
         return 0;
     }
+    if (image && S.scan_copy && !work->disabled) {
+        const int copied = nvk_scanout_copy(image, output, output_scale_x, output_scale_y);
+        if (copied >= 0) return copied;
+    }
+    output->copied = 0;
     int background = work->disabled;
     if (!image && work->scanout_canonical_width < work->scanout_width)
         for (unsigned row = 0; row < work->scanout_height; ++row) background |= work->row_planes[row] == 0;
@@ -4003,9 +4353,12 @@ static int nvk_hash_record(const NvkPlane *image)
     if (!S.pipe_hash || (option && option[0] == '0')) return 1;
     const uint64_t pixels = (uint64_t)image->width * image->height;
     if (!pixels || pixels > UINT32_MAX) return 1;
+    /* The group results are XOR-combined, so the digest does not depend on the
+     * group count. Enough groups to occupy the device keep the pass bandwidth-
+     * rather than latency-bound on slow memory clocks. */
     const char *group_option = getenv("PSX_NATIVE_VK_HASH_GROUPS");
-    uint32_t limit = group_option ? (uint32_t)strtoul(group_option, NULL, 10) : 128u;
-    if (!limit || limit > 1024u) limit = 128u;
+    uint32_t limit = group_option ? (uint32_t)strtoul(group_option, NULL, 10) : 1024u;
+    if (!limit || limit > 1024u) limit = 1024u;
     const uint32_t groups = pixels > (uint64_t)limit * 128u ? limit : (uint32_t)((pixels + 127u) / 128u);
     VkDescriptorSet set = nvk_set_alloc(S.dsl_hash);
     if (!set) return 0;
@@ -4394,9 +4747,11 @@ static int nvk_init(void)
     if (caps->min_uniform_buffer_offset_alignment > NVK_SLOT_ALIGN) { nvk_note("uniform offset alignment above 256"); return 0; }
     if (caps->max_texel_buffer_elements < 524288u) { nvk_note("texel buffers smaller than one VRAM snapshot"); return 0; }
     VkDevice dev = vk_core_device();
+    /* Opt-in: ordered interlock costs more per fragment than the core tier's
+     * specialized pipelines and layer barriers (about 2.3x per phase). */
     const char *tier = getenv("PSX_NATIVE_GPU_INTERLOCK");
     S.interlock = caps->fragment_shader_interlock && caps->fragment_stores_and_atomics &&
-        caps->max_texel_buffer_elements >= NVK_ARENA_CHUNK / 16u && !(tier && tier[0] == '0');
+        caps->max_texel_buffer_elements >= NVK_ARENA_CHUNK / 16u && tier && tier[0] == '1';
     const char *specialize = getenv("PSX_NATIVE_VK_SPECIALIZE");
     S.specialize_materials = !S.interlock && !(specialize && specialize[0] == '0');
     const char *hardware_aniso = getenv("PSX_NATIVE_VK_HARDWARE_ANISO");
@@ -4408,6 +4763,12 @@ static int nvk_init(void)
         const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         S.hardware_aniso = (format.optimalTilingFeatures & required) == required;
     }
+    const char *committed_delta = getenv("PSX_NATIVE_VK_COMMITTED_DELTA");
+    S.committed_delta = !(committed_delta && committed_delta[0] == '0');
+    const char *merge_runs = getenv("PSX_NATIVE_VK_MERGE_RUNS");
+    S.merge_runs = !(merge_runs && merge_runs[0] == '0');
+    const char *scan_copy = getenv("PSX_NATIVE_VK_SCAN_COPY");
+    S.scan_copy = !(scan_copy && scan_copy[0] == '0');
     const char *early = getenv("PSX_NATIVE_VK_EARLY_REJECT");
     S.early_reject = early && early[0] == '1';
     const char *single_tap = getenv("PSX_NATIVE_VK_ANISO_SINGLE_TAP");
@@ -4476,18 +4837,21 @@ static int nvk_init(void)
     S.vertex_footprint = properties.limits.maxVertexOutputComponents >= 72u &&
         properties.limits.maxFragmentInputComponents >= 72u && !(footprint && footprint[0] == '0');
     const char *tile = getenv("PSX_NATIVE_VK_DAMAGE_TILE");
-    S.damage_tile_shift = tile && !strcmp(tile, "16") ? 4u : tile && !strcmp(tile, "32") ? 5u : 6u;
+    S.damage_tile_shift = tile && !strcmp(tile, "4") ? 2u : tile && !strcmp(tile, "8") ? 3u : tile && !strcmp(tile, "16") ? 4u : tile && !strcmp(tile, "32") ? 5u : 6u;
+    S.damage_tile_set = tile != NULL;
     const char *damage = getenv("PSX_NATIVE_VK_PHASE_DAMAGE");
     S.phase_damage = !(damage && damage[0] == '0');
     const char *shader_damage = getenv("PSX_NATIVE_VK_SHADER_DAMAGE");
-    S.shader_damage = !(shader_damage && shader_damage[0] == '0');
+    /* Opt-in: a fragment discarded by the tile mask still costs its shading
+     * slot; scissored damage rectangles never rasterize those pixels. */
+    S.shader_damage = shader_damage && shader_damage[0] == '1';
     const char *regions = getenv("PSX_NATIVE_VK_SMAA_REGIONS");
     S.damage_regions = regions && regions[0] == '2' ? 4 : regions && regions[0] == '1' ? 2 : 0;
     const char *depth_bounds = getenv("PSX_NATIVE_VK_DEPTH_BOUNDS");
     S.depth_bounds = !S.interlock && depth_bounds && depth_bounds[0] == '1';
     S.submit_draw_limit = NVK_SUBMIT_DRAWS;
     const char *clear_spans = getenv("PSX_NATIVE_VK_CLEAR_SPANS");
-    S.clear_spans = clear_spans && clear_spans[0] == '1';
+    S.clear_spans = !(clear_spans && clear_spans[0] == '0');
     const char *submit_limit = getenv("PSX_NATIVE_VK_SUBMIT_DRAWS");
     if (submit_limit) {
         const unsigned long limit = strtoul(submit_limit, NULL, 10);
@@ -4832,6 +5196,53 @@ static void nvk_planes_to_spare(void)
     }
 }
 
+/* Publication exchanges the work's planes with the committed ones and
+ * records what the work changed relative to the state it started from. */
+static void nvk_commit_planes(void)
+{
+    const uint64_t seq = ++S.commit_seq;
+    const unsigned slot = (unsigned)(seq % NVK_COMMIT_HISTORY);
+    S.commit_tag[slot] = seq;
+    for (uint32_t i = 0u; i < GL_NATIVE_GPU_PHASE_BASE; ++i) {
+        const NvkPlane old = S.committed[i];
+        S.committed[i] = S.work_planes[i];
+        S.work_planes[i] = old;
+        NvkPlane *p = &S.committed[i];
+        S.commit_all[slot][i] = !p->color.image || p->written_all || !p->base_seq || p->base_seq + 1u != seq;
+        memcpy(S.commit_written[slot][i], p->written, sizeof(p->written));
+        p->content_seq = p->color.image ? seq : 0u;
+        p->base_seq = 0u;
+        p->written_all = 0;
+        memset(p->written, 0, sizeof(p->written));
+    }
+    nvk_planes_to_spare();
+}
+
+/* The physical pixels where a retired plane differs from the committed one:
+ * the union of every publication since the retired plane was committed.
+ * Returns 0 when it is not known, -1 when nothing differs. */
+static int nvk_committed_delta(const NvkPlane *p, const NvkPlane *committed, unsigned plane, int32_t rect[4])
+{
+    if (!S.committed_delta || !p->content_seq || p->written_all || p->written[0] < p->written[2] || !committed->content_seq ||
+        p->content_seq >= committed->content_seq || committed->content_seq - p->content_seq > NVK_COMMIT_HISTORY ||
+        p->has_key != committed->has_key || p->color.width != committed->color.width ||
+        p->color.height != committed->color.height) return 0;
+    rect[0] = rect[1] = INT32_MAX; rect[2] = rect[3] = INT32_MIN;
+    for (uint64_t seq = p->content_seq + 1u; seq <= committed->content_seq; ++seq) {
+        const unsigned slot = (unsigned)(seq % NVK_COMMIT_HISTORY);
+        if (S.commit_tag[slot] != seq || S.commit_all[slot][plane]) return 0;
+        const int32_t *w = S.commit_written[slot][plane];
+        if (w[0] >= w[2] || w[1] >= w[3]) continue;
+        if (w[0] < rect[0]) rect[0] = w[0]; if (w[1] < rect[1]) rect[1] = w[1];
+        if (w[2] > rect[2]) rect[2] = w[2]; if (w[3] > rect[3]) rect[3] = w[3];
+    }
+    if (rect[0] >= rect[2]) return -1;
+    if (rect[0] < 0) rect[0] = 0; if (rect[1] < 0) rect[1] = 0;
+    if (rect[2] > (int32_t)p->color.width) rect[2] = (int32_t)p->color.width;
+    if (rect[3] > (int32_t)p->color.height) rect[3] = (int32_t)p->color.height;
+    return rect[0] < rect[2] && rect[1] < rect[3] ? 1 : -1;
+}
+
 /* The CPU needs the pixels of image 0 (digest), of the other images only for an audit or probe. */
 static int s_backend_mode;
 static int nvk_wants_readback(unsigned image)
@@ -4884,10 +5295,10 @@ static int nvk_phase_command_equal(const GlNativeGpuCommand *a, const GlNativeGp
         (!draw || !memcmp(&a->draw, &b->draw, sizeof(a->draw)));
 }
 
-static void nvk_damage_mark(uint8_t *tiles, uint32_t columns, const int32_t clip[4],
+static void nvk_damage_mark(uint8_t *tiles, uint32_t columns, const int32_t clip[4], unsigned shift,
                             int left, int top, int right, int bottom)
 {
-    const int tile = 1 << S.damage_tile_shift;
+    const int tile = 1 << shift;
     if (left < clip[0]) left = clip[0]; if (top < clip[1]) top = clip[1];
     if (right > clip[2]) right = clip[2]; if (bottom > clip[3]) bottom = clip[3];
     if (left >= right || top >= bottom) return;
@@ -4895,36 +5306,57 @@ static void nvk_damage_mark(uint8_t *tiles, uint32_t columns, const int32_t clip
         for (int x = left / tile; x <= (right - 1) / tile; ++x) tiles[(uint32_t)y * columns + (uint32_t)x] = 1u;
 }
 
-static void nvk_damage_primitive(uint8_t *tiles, uint32_t columns, const int32_t clip[4],
+static void nvk_damage_primitive(uint8_t *tiles, uint32_t columns, const int32_t clip[4], unsigned shift,
                                  uint32_t scale, const GlNativeGpuDrawGeometry *geometry)
 {
-    if (geometry->visible) nvk_damage_mark(tiles, columns, clip, geometry->left * (int)scale,
+    if (geometry->visible) nvk_damage_mark(tiles, columns, clip, shift, geometry->left * (int)scale,
         geometry->top * (int)scale, (geometry->right + 1) * (int)scale, (geometry->bottom + 1) * (int)scale);
 }
 
-static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuChunk *current)
+/* The damage of a phase chunk against its predecessor: tiles, the merged
+ * rectangles and their union, in physical pixels of the phase plane. Pure in
+ * the work, the plane geometry and the two chunks, so the phase planner can
+ * evaluate it ahead of the executor. 1 with d->tiles owned by the caller,
+ * 0 when the phase is replayed whole. */
+typedef struct NvkDamage {
+    unsigned shift;
+    uint32_t count, columns, rows, origin, scale;
+    int32_t rects[128][4], uni[4], clip[4];
+    int mapped;
+    unsigned bands;
+    uint64_t area, full;
+    uint8_t *tiles;
+} NvkDamage;
+
+static int nvk_damage_compute(const GlNativeGpuWork *work, const NvkPlane *planes, const GlNativeGpuChunk *previous,
+                              const GlNativeGpuChunk *current, NvkDamage *d)
 {
-    if (R.work->render_width) return 0;
-    const uint32_t tile = 1u << S.damage_tile_shift;
-    R.damage_count = 0u;
-    R.damage_shader_active = 0;
-    if (!S.phase_damage || S.interlock || !s_backend_mode || R.work->wireframe || R.work->depth_view ||
+    const int mapped = work->render_width != 0;
+    /* Host-grid tiles are guest pixels, each many physical ones wide. */
+    d->shift = mapped && !S.damage_tile_set ? 4u : S.damage_tile_shift;
+    const uint32_t tile = 1u << d->shift;
+    d->count = 0u;
+    d->tiles = NULL;
+    if (!S.phase_damage || !s_backend_mode || work->wireframe || work->depth_view ||
         !previous->geometry || !current->geometry || !previous->geometry->primitives || !current->geometry->primitives ||
         previous->geometry->gpu_setup || current->geometry->gpu_setup || !current->count ||
         previous->count != current->count) return 0;
     const GlNativeGpuCommand *seed = &current->commands[0], *old_seed = &previous->commands[0];
     if (seed->kind != NATIVE_GPU_SPAN || !nvk_phase_command_equal(seed, old_seed, 0) || (seed->mask & 2u) ||
-        seed->x != R.work->phase_crop_x || seed->y != R.work->phase_crop_y ||
-        seed->w != R.work->scanout_width || seed->h != R.work->scanout_height ||
+        seed->x != work->phase_crop_x || seed->y != work->phase_crop_y ||
+        seed->w != work->scanout_width || seed->h != work->scanout_height ||
         seed->plane < GL_NATIVE_GPU_PHASE_BASE || old_seed->plane < GL_NATIVE_GPU_PHASE_BASE ||
         seed->plane >= GL_NATIVE_GPU_PLANES || old_seed->plane >= GL_NATIVE_GPU_PLANES) return 0;
-    const NvkPlane *plane = &R.planes[seed->plane], *old = &R.planes[old_seed->plane];
+    const NvkPlane *plane = &planes[seed->plane], *old = &planes[old_seed->plane];
     if (!plane->color.image || !old->color.image || plane->width != old->width || plane->height != old->height ||
         plane->has_key != old->has_key) return 0;
     const uint32_t scale = native_gpu_plane_scale(R.work, seed->plane);
     const int32_t clip[4] = { seed->x * (int)scale, seed->y * (int)scale,
         (seed->x + seed->w) * (int)scale, (seed->y + seed->h) * (int)scale };
     if (clip[0] < 0 || clip[1] < 0 || clip[2] > (int)plane->width || clip[3] > (int)plane->height) return 0;
+    /* A host-grid plane maps the virtual damage tiles through one page. */
+    const uint32_t origin = mapped && plane->page_rows ? (uint32_t)clip[1] / plane->page_rows * plane->page_rows : 0u;
+    if (mapped && plane->page_rows && (uint32_t)(clip[3] - 1) / plane->page_rows != (uint32_t)clip[1] / plane->page_rows) return 0;
     const uint32_t columns = (plane->width + tile - 1u) / tile, rows = (plane->height + tile - 1u) / tile;
     if (!columns || !rows || (uint64_t)columns * rows > 65536u) return 0;
     uint8_t *tiles = calloc((size_t)columns * rows, 1u);
@@ -4949,8 +5381,8 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
             for (uint32_t t = 0u; t < count; ++t) {
                 if (shared && (!b->mesh_count || !memcmp(previous->data + a->data + (size_t)t * sizeof(GlNativeGpuMeshTriangle),
                     current->data + b->data + (size_t)t * sizeof(GlNativeGpuMeshTriangle), sizeof(GlNativeGpuMeshTriangle)))) continue;
-                nvk_damage_primitive(tiles, columns, clip, scale, &previous->geometry->primitives[previous->geometry->offsets[c].primitive + t]);
-                nvk_damage_primitive(tiles, columns, clip, scale, &current->geometry->primitives[current->geometry->offsets[c].primitive + t]);
+                nvk_damage_primitive(tiles, columns, clip, d->shift, scale, &previous->geometry->primitives[previous->geometry->offsets[c].primitive + t]);
+                nvk_damage_primitive(tiles, columns, clip, d->shift, scale, &current->geometry->primitives[current->geometry->offsets[c].primitive + t]);
             }
         } else if (b->kind == NATIVE_GPU_SPAN || b->kind == NATIVE_GPU_SPANS) {
             if ((a->source != UINT32_MAX && a->source < GL_NATIVE_GPU_BASE_SOURCE) ||
@@ -4963,9 +5395,9 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
                 same = same && !memcmp(previous->data + a->data, current->data + b->data, (size_t)bytes);
             }
             if (!same) {
-                nvk_damage_mark(tiles, columns, clip, a->x * (int)scale, a->y * (int)scale,
+                nvk_damage_mark(tiles, columns, clip, d->shift, a->x * (int)scale, a->y * (int)scale,
                     (a->x + a->w) * (int)scale, (a->y + a->h) * (int)scale);
-                nvk_damage_mark(tiles, columns, clip, b->x * (int)scale, b->y * (int)scale,
+                nvk_damage_mark(tiles, columns, clip, d->shift, b->x * (int)scale, b->y * (int)scale,
                     (b->x + b->w) * (int)scale, (b->y + b->h) * (int)scale);
             }
         } else valid = 0;
@@ -4993,7 +5425,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
             int x0 = (int)left * (int)tile, x1 = (int)right * (int)tile, y0 = (int)top * (int)tile, y1 = (int)bottom * (int)tile;
             if (x0 < clip[0]) x0 = clip[0]; if (y0 < clip[1]) y0 = clip[1];
             if (x1 > clip[2]) x1 = clip[2]; if (y1 > clip[3]) y1 = clip[3];
-            int32_t *rect = R.damage_rects[R.damage_count++];
+            int32_t *rect = d->rects[d->count++];
             rect[0] = x0; rect[1] = y0; rect[2] = x1 - x0; rect[3] = y1 - y0;
             area += (uint64_t)(x1 - x0) * (uint32_t)(y1 - y0);
         }
@@ -5008,40 +5440,104 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
         if (left >= right || top >= bottom) continue;
         area += (uint64_t)(right - left) * (bottom - top);
         uint32_t r;
-        for (r = 0u; r < R.damage_count; ++r) {
-            int32_t *rect = R.damage_rects[r];
+        for (r = 0u; r < d->count; ++r) {
+            int32_t *rect = d->rects[r];
             if (rect[0] == left && rect[2] == right - left && rect[1] + rect[3] == top) {
                 rect[3] += bottom - top; break;
             }
         }
-        if (r == R.damage_count) {
-            if (r == sizeof(R.damage_rects) / sizeof(R.damage_rects[0])) { valid = 0; break; }
-            int32_t *rect = R.damage_rects[R.damage_count++];
+        if (r == d->count) {
+            if (r == sizeof(d->rects) / sizeof(d->rects[0])) { valid = 0; break; }
+            int32_t *rect = d->rects[d->count++];
             rect[0] = left; rect[1] = top; rect[2] = right - left; rect[3] = bottom - top;
         }
     }
     const uint64_t full = (uint64_t)seed->w * seed->h * scale * scale;
-    if (!valid || area * 5u >= full * 4u) { free(tiles); R.damage_count = 0u; return 0; }
+    if (!valid || area * 5u >= full * 4u) { free(tiles); d->count = 0u; return 0; }
+    d->uni[0] = d->uni[1] = INT32_MAX; d->uni[2] = d->uni[3] = INT32_MIN;
+    for (uint32_t i = 0u; i < d->count; ++i) {
+        const int32_t *r = d->rects[i];
+        if (r[0] < d->uni[0]) d->uni[0] = r[0];
+        if (r[1] < d->uni[1]) d->uni[1] = r[1];
+        if (r[0] + r[2] > d->uni[2]) d->uni[2] = r[0] + r[2];
+        if (r[1] + r[3] > d->uni[3]) d->uni[3] = r[1] + r[3];
+    }
+    d->columns = columns; d->rows = rows; d->origin = origin; d->scale = scale; d->mapped = mapped;
+    memcpy(d->clip, clip, sizeof(d->clip));
+    d->bands = bands; d->area = area; d->full = full; d->tiles = tiles;
+    return 1;
+}
+
+static NvkDamage s_damage;
+
+static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuChunk *current)
+{
+    NvkDamage *d = &s_damage;
+    R.damage_count = 0u;
+    R.damage_shader_active = 0;
+    const int damaged = nvk_damage_compute(R.work, R.planes, previous, current, d);
+    R.damage_shift = d->shift;
+    if (!damaged) return 0;
+    R.damage_count = d->count;
+    memcpy(R.damage_rects, d->rects, (size_t)d->count * sizeof(d->rects[0]));
+    memcpy(R.damage_union, d->uni, sizeof(R.damage_union));
+    const int mapped = d->mapped;
+    const uint32_t tile = 1u << d->shift, columns = d->columns, rows = d->rows, origin = d->origin, scale = d->scale;
+    const int32_t *clip = d->clip;
+    const unsigned bands = d->bands;
+    const uint64_t area = d->area, full = d->full;
+    uint8_t *tiles = d->tiles;
+    d->tiles = NULL;
+    const GlNativeGpuCommand *seed = &current->commands[0], *old_seed = &previous->commands[0];
+    const NvkPlane *plane = &R.planes[seed->plane], *old = &R.planes[old_seed->plane];
+    (void)tile;
     if (S.shader_damage && S.core_batch && (!S.capture_enabled || S.hd_batch) && !bands) {
-        const uint32_t words = 5u + (columns * rows + 31u) / 32u;
+        /* Mask words: geometry, clip, [mapped: lookup offsets], tile bits,
+         * [mapped: 16-bit tile column per physical x, tile row per physical y].
+         * A host-grid plane classifies each physical pixel by its centre, as
+         * nvk_scissor places the damage rectangles. */
+        int32_t pclip[4] = { clip[0], clip[1], clip[2], clip[3] };
+        if (mapped) {
+            for (unsigned i = 0u; i < 4u; ++i) pclip[i] = nvk_raster_edge_in(plane, clip[i], i & 1u, origin);
+            if (pclip[0] < 0) pclip[0] = 0; if (pclip[1] < 0) pclip[1] = 0;
+            if (pclip[2] > (int)plane->color.width) pclip[2] = (int)plane->color.width;
+            if (pclip[3] > (int)plane->color.height) pclip[3] = (int)plane->color.height;
+        }
+        const uint32_t head = mapped ? 7u : 5u, bits = (columns * rows + 31u) / 32u;
+        const uint32_t x_lut = head + bits, y_lut = x_lut + (mapped ? ((uint32_t)pclip[2] + 1u) / 2u : 0u);
+        const uint32_t words = y_lut + (mapped ? ((uint32_t)pclip[3] + 1u) / 2u : 0u);
         uint32_t chunk; VkDeviceSize offset;
-        uint32_t mask[5u + 2048u];
-        void *upload = nvk_arena(words * sizeof(*mask), 16u, &chunk, &offset);
+        uint32_t *mask = calloc(words, sizeof(*mask));
+        void *upload = mask && (!mapped || (pclip[0] < pclip[2] && pclip[1] < pclip[3]))
+            ? nvk_arena(words * sizeof(*mask), 16u, &chunk, &offset) : NULL;
         if (upload) {
-            memset(mask, 0, words * sizeof(*mask));
-            mask[0] = columns | (S.damage_tile_shift << 16u); memcpy(mask + 1u, clip, sizeof(clip));
+            mask[0] = columns | (R.damage_shift << 16u) | (mapped ? 0x80000000u : 0u);
+            memcpy(mask + 1u, pclip, sizeof(pclip));
+            if (mapped) { mask[5] = x_lut; mask[6] = y_lut; }
             for (uint32_t i = 0u; i < columns * rows; ++i)
-                if (tiles[i]) mask[5u + i / 32u] |= 1u << (i % 32u);
+                if (tiles[i]) mask[head + i / 32u] |= 1u << (i % 32u);
+            for (unsigned axis = 0u; mapped && axis < 2u; ++axis) {
+                uint16_t *lut = (uint16_t *)(mask + (axis ? y_lut : x_lut));
+                const int lo = clip[axis], hi = clip[axis + 2u];
+                for (int t = lo / (int)tile; t * (int)tile < hi; ++t) {
+                    int a = nvk_raster_edge_in(plane, t * (int)tile > lo ? t * (int)tile : lo, axis, origin);
+                    int b = nvk_raster_edge_in(plane, (t + 1) * (int)tile < hi ? (t + 1) * (int)tile : hi, axis, origin);
+                    if (a < pclip[axis]) a = pclip[axis];
+                    if (b > pclip[axis + 2u]) b = pclip[axis + 2u];
+                    for (int x = a; x < b; ++x) lut[x] = (uint16_t)t;
+                }
+            }
             memcpy(upload, mask, words * sizeof(*mask));
             R.damage_buffer = S.chunks[chunk].buf.buffer;
             R.damage_word_offset = (uint32_t)(offset / sizeof(*mask));
             R.damage_shader_active = 1;
         }
+        free(mask);
     }
     free(tiles);
     const char *copy_elision = getenv("PSX_NATIVE_VK_PHASE_COPY_ELISION");
     const char *reuse_plane = getenv("PSX_NATIVE_VK_PHASE_REUSE");
-    if (R.work->scanout && reuse_plane && reuse_plane[0] == '1') {
+    if (R.work->scanout && !(reuse_plane && reuse_plane[0] == '0')) {
         /* Save the completed immutable image before recycling its working
          * surface. The validated recipe only reads its own destination and
          * immutable base textures. Later phases therefore need the previous
@@ -5074,16 +5570,19 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
             target->color.image, VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
         nvk_barrier_all();
         target->dirty_all = 1;
+        target->written_all = 1;
         /* Retain conservative CPU bounds until the seed initializes damage. */
         free(target->depth_max);
         target->depth_max = NULL;
         target->depth_zero = 0;
     } else {
-        nvk_plane_copy(old, &R.planes[seed->plane], 0);
-        if (old->has_key) nvk_plane_copy(old, &R.planes[seed->plane], 1);
+        nvk_plane_copy(old, &R.planes[seed->plane], 0, 2u);
+        if (old->has_key) nvk_plane_copy(old, &R.planes[seed->plane], 1, 2u);
     }
     R.damage_plane = seed->plane;
     const unsigned image = seed->plane - GL_NATIVE_GPU_PHASE_BASE + 1u;
+    /* Scanout damage is in image pixels: physical ones for a host-grid plane,
+     * whose regions stay unpublished. */
     if (R.work->scanout && image < NVK_IMAGES && scale == R.work->scale) {
         NvkPlane *output = &S.images[image];
         int32_t bounds[4] = { clip[2], clip[3], clip[0], clip[1] };
@@ -5096,12 +5595,15 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
         }
         if (R.damage_count) {
             P.damage_bounds_pixels += (uint64_t)(bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
-            for (unsigned i = 0u; i < 4u; ++i) bounds[i] -= clip[i & 1u];
+            for (unsigned i = 0u; i < 4u; ++i)
+                bounds[i] = mapped ? nvk_raster_edge_in(plane, bounds[i], i & 1u, origin) -
+                                     nvk_raster_edge_in(plane, clip[i & 1u], i & 1u, origin)
+                                   : bounds[i] - clip[i & 1u];
         } else memset(bounds, 0, sizeof(bounds));
         memcpy(output->damage_bounds, bounds, sizeof(bounds));
         output->damage_valid = 1;
-        output->damage_regions_side = S.damage_regions;
-        if (S.damage_regions) {
+        output->damage_regions_side = mapped ? 0 : S.damage_regions;
+        if (output->damage_regions_side) {
             memset(output->damage_regions, 0, sizeof(output->damage_regions));
             const unsigned side = (unsigned)S.damage_regions;
             for (unsigned q = 0u; q < side * side; ++q) {
@@ -5128,6 +5630,268 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
     }
     ++P.damage_phases; P.damage_pixels += area; P.damage_full_pixels += full;
     return 1;
+}
+
+
+/* ---- phase planner ----------------------------------------------------------------------------------------------------------- */
+/* The phase chunks of one work repeat a single command structure (the damage
+ * comparison requires it). The executor records the scheduled runs of chunk 1;
+ * the planner then evaluates the damage and layer plans of the later chunks
+ * on the host job pool while earlier chunks are recorded. A plan is taken only
+ * when its damage, run range and per-command inputs equal the executor's own;
+ * otherwise the executor plans the run itself, exactly as before. */
+enum { NVK_PREPLAN_RUNS = 64 };
+typedef struct NvkRunDesc { uint32_t first, end; uint8_t plane, merged; } NvkRunDesc;
+typedef struct NvkPrePlan {
+    int result;                 /* nvk_schedule_plan's; 0 not planned */
+    uint32_t ncmd;
+    NvkPlanResult plan;
+    GlNativeSchedPrim *prim; GlNativeGpuShape *shape; uint16_t *layer; NvkSchedCommand *cmd; uint8_t *depth_fast;
+    uint32_t prim_cap, shape_cap, layer_cap, cmd_cap, depth_cap;
+} NvkPrePlan;
+typedef struct NvkChunkPlan {
+    SDL_atomic_t ready;
+    int damaged;
+    uint32_t damage_count;
+    int32_t damage[128][4];
+    NvkPrePlan runs[NVK_PREPLAN_RUNS];
+} NvkChunkPlan;
+static struct {
+    SDL_Thread *thread;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+    int pending, busy, stop, disabled;
+    const GlNativeGpuWork *work;
+    NvkPlane planes[GL_NATIVE_GPU_PLANES];   /* geometry snapshot; Vulkan objects are never touched */
+    NvkRunDesc runs[NVK_PREPLAN_RUNS];
+    uint32_t run_count, first, end;          /* planned chunks [first, end) */
+    int recording, overflow;
+    int active;                              /* chunk whose plans the executor is taking, -1 none */
+    uint32_t ordinal;
+    NvkChunkPlan chunks[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
+    uint64_t taken, rejected, chunks_planned;
+} PL = { .active = -1 };
+
+static int nvk_preplan_copy(void **p, uint32_t *cap, const void *src, uint32_t count, size_t size)
+{
+    if (!nvk_sched_reserve(p, cap, count ? count : 1u, size)) return 0;
+    if (count) memcpy(*p, src, (size_t)count * size);
+    return 1;
+}
+
+static void nvk_preplan_chunk(uint32_t c)
+{
+    NvkChunkPlan *cp = &PL.chunks[c];
+    const GlNativeGpuWork *work = PL.work;
+    const GlNativeGpuChunk *previous = &work->phase_chunks[c - 1u], *current = &work->phase_chunks[c];
+    for (uint32_t j = 0u; j < PL.run_count; ++j) cp->runs[j].result = 0;
+    NvkDamage d;
+    cp->damaged = nvk_damage_compute(work, PL.planes, previous, current, &d);
+    cp->damage_count = cp->damaged ? d.count : 0u;
+    if (cp->damaged) {
+        memcpy(cp->damage, d.rects, (size_t)d.count * sizeof(d.rects[0]));
+        free(d.tiles);
+    }
+    const GlNativeGpuGeometry *geometry = current->geometry;
+    const GlNativePhaseTemplates *cache = work->phase_templates;
+    if (!geometry || !geometry->primitives || !current->count || (cp->damaged && !cp->damage_count)) goto done;
+    const float (*slice)[GL_NATIVE_GPU_VERTEX_FLOATS] = geometry->vertices + geometry->offsets[0].vertex;
+    /* Each chunk draws into its own phase plane: chunk 1's runs on its seed
+     * plane are this chunk's runs on its seed plane. */
+    const unsigned seed1 = work->phase_chunks[1].commands[0].plane, seed = current->commands[0].plane;
+    for (uint32_t j = 0u; j < PL.run_count; ++j) {
+        NvkRunDesc local = PL.runs[j];
+        const NvkRunDesc *run = &local;
+        if (local.plane == seed1) local.plane = (uint8_t)seed;
+        if (run->end > current->count || run->first >= run->end) continue;
+        uint32_t vertex = 0u, ncmd = 0u;
+        for (uint32_t i = 0u; i < run->first; ++i) vertex += native_gpu_command_vertex_count(&current->commands[i]);
+        GlNativeGpuCommand *copies = run->merged ? malloc((size_t)(run->end - run->first) * sizeof(*copies)) : NULL;
+        int usable = !run->merged || copies;
+        for (uint32_t i = run->first; i < run->end && usable; ++i) {
+            const GlNativeGpuCommand *command = &current->commands[i];
+            if (run->merged && command->kind == NATIVE_GPU_TEMPLATE) {
+                const GlNativeGpuGeometry *g = cache ? cache->geometry : NULL;
+                if (!g || !g->primitives || command->data >= cache->count) { usable = 0; break; }
+                copies[i - run->first] = cache->commands[command->data];
+                copies[i - run->first].plane = run->plane;
+                s_sched_src[ncmd++] = (NvkSchedSource){ .command = &copies[i - run->first], .data = cache->data,
+                    .vertices = g->vertices, .vertex = g->offsets[command->data].vertex,
+                    .prepared = g->primitives + g->offsets[command->data].primitive, .vsrc = 2u };
+            } else if (run->merged || command->plane == run->plane) {
+                s_sched_src[ncmd++] = (NvkSchedSource){ .command = command, .data = current->data, .vertices = slice,
+                    .vertex = vertex, .prepared = geometry->primitives + geometry->offsets[i].primitive,
+                    .vsrc = run->merged ? 1u : 0u };
+            }
+            vertex += native_gpu_command_vertex_count(command);
+        }
+        NvkPrePlan *pp = &cp->runs[j];
+        NvkPlanResult result;
+        int planned = 0;
+        if (usable && ncmd) {
+            NvkPlane *plane = &PL.planes[run->plane];
+            nvk_hz_grid(plane);
+            planned = nvk_schedule_plan(work, plane, native_gpu_plane_scale(work, run->plane), ncmd, NULL, 0,
+                cp->damaged ? (const int32_t (*)[4])cp->damage : NULL, cp->damage_count, &result);
+            g_native_hz_grid.active = 0;
+        }
+        free(copies);
+        if (planned != 2) continue;
+        const NativeSchedState *sched = &s_sched;
+        if (!nvk_preplan_copy((void **)&pp->prim, &pp->prim_cap, sched->prim, result.prim_count, sizeof(*pp->prim)) ||
+            !nvk_preplan_copy((void **)&pp->shape, &pp->shape_cap, sched->shape, result.shape_count, sizeof(*pp->shape)) ||
+            !nvk_preplan_copy((void **)&pp->layer, &pp->layer_cap, sched->layer, result.total, sizeof(*pp->layer)) ||
+            !nvk_preplan_copy((void **)&pp->cmd, &pp->cmd_cap, s_sched_cmd, ncmd, sizeof(*pp->cmd)) ||
+            !nvk_preplan_copy((void **)&pp->depth_fast, &pp->depth_cap, s_sched_depth_fast, result.total, sizeof(*pp->depth_fast)))
+            continue;
+        pp->ncmd = ncmd;
+        pp->plan = result;
+        pp->result = 2;
+    }
+done:
+    SDL_LockMutex(PL.mutex);
+    SDL_AtomicSet(&cp->ready, 1);
+    SDL_CondBroadcast(PL.cond);
+    SDL_UnlockMutex(PL.mutex);
+}
+
+static void nvk_preplan_range(uint32_t begin, uint32_t end, void *unused)
+{
+    (void)unused;
+    for (uint32_t i = begin; i < end; ++i) nvk_preplan_chunk(PL.first + i);
+}
+
+static int nvk_preplan_thread(void *unused)
+{
+    (void)unused;
+    SDL_LockMutex(PL.mutex);
+    for (;;) {
+        while (!PL.pending && !PL.stop) SDL_CondWait(PL.cond, PL.mutex);
+        if (PL.stop) break;
+        PL.pending = 0;
+        PL.busy = 1;
+        SDL_UnlockMutex(PL.mutex);
+        psx_parallel_for(PL.end - PL.first, 1u, nvk_preplan_range, NULL);
+        SDL_LockMutex(PL.mutex);
+        PL.chunks_planned += PL.end - PL.first;
+        PL.busy = 0;
+        SDL_CondBroadcast(PL.cond);
+    }
+    SDL_UnlockMutex(PL.mutex);
+    return 0;
+}
+
+/* Waits until the planner no longer reads the work's chunks. */
+static void nvk_preplan_finish(void)
+{
+    PL.recording = 0;
+    PL.active = -1;
+    if (!PL.mutex) return;
+    SDL_LockMutex(PL.mutex);
+    while (PL.pending || PL.busy) SDL_CondWait(PL.cond, PL.mutex);
+    PL.first = PL.end = 0u;   /* the plans belong to this work only */
+    SDL_UnlockMutex(PL.mutex);
+}
+
+static void nvk_preplan_stop(void)
+{
+    if (!PL.thread) return;
+    SDL_LockMutex(PL.mutex);
+    PL.stop = 1;
+    SDL_CondBroadcast(PL.cond);
+    SDL_UnlockMutex(PL.mutex);
+    SDL_WaitThread(PL.thread, NULL);
+    PL.thread = NULL;
+    PL.stop = 0;
+}
+
+/* Chunk c of the phase loop begins (after its damage): record chunk 1's runs,
+ * take the plans of the later chunks. */
+static void nvk_preplan_begin_chunk(uint32_t c)
+{
+    PL.active = -1;
+    PL.ordinal = 0u;
+    if (PL.disabled) return;
+    if (c == 1u) {
+        PL.recording = 1;
+        PL.overflow = 0;
+        PL.run_count = 0u;
+        return;
+    }
+    if (c < PL.first || c >= PL.end || !PL.mutex) return;
+    NvkChunkPlan *cp = &PL.chunks[c];
+    SDL_LockMutex(PL.mutex);
+    while (!SDL_AtomicGet(&cp->ready) && (PL.pending || PL.busy)) SDL_CondWait(PL.cond, PL.mutex);
+    SDL_UnlockMutex(PL.mutex);
+    if (!SDL_AtomicGet(&cp->ready) || cp->damaged != R.damage_active ||
+        (R.damage_active && (cp->damage_count != R.damage_count ||
+         memcmp(cp->damage, R.damage_rects, (size_t)R.damage_count * sizeof(R.damage_rects[0]))))) {
+        ++PL.rejected;
+        return;
+    }
+    PL.active = (int)c;
+}
+
+/* After chunk 1: plan chunks [2, end) of a sealed work in the background. */
+static void nvk_preplan_launch(const GlNativeGpuWork *work, uint32_t end)
+{
+    PL.recording = 0;
+    if (PL.disabled || PL.overflow || !PL.run_count || end <= 2u || end > GL_NATIVE_MOTION_PHASE_CAPACITY + 1u ||
+        S.interlock || work->wireframe || work->depth_view || R.capture_active || (!work->render_width && S.depth_bounds))
+        return;
+    if (!PL.thread) {
+        if (!PL.mutex) PL.mutex = SDL_CreateMutex();
+        if (!PL.cond) PL.cond = SDL_CreateCond();
+        if (PL.mutex && PL.cond) PL.thread = SDL_CreateThread(nvk_preplan_thread, "native-vk-plan", NULL);
+        if (!PL.thread) { PL.disabled = 1; return; }
+    }
+    SDL_LockMutex(PL.mutex);
+    PL.work = work;
+    memcpy(PL.planes, R.planes, sizeof(PL.planes));
+    PL.first = 2u;
+    PL.end = end;
+    for (uint32_t c = PL.first; c < end; ++c) SDL_AtomicSet(&PL.chunks[c].ready, 0);
+    PL.pending = 1;
+    SDL_CondBroadcast(PL.cond);
+    SDL_UnlockMutex(PL.mutex);
+}
+
+static int nvk_preplan_take(unsigned plane_index, uint32_t ncmd, NvkPlanResult *out)
+{
+    if (PL.recording) {
+        if (PL.run_count == NVK_PREPLAN_RUNS) PL.overflow = 1;
+        else PL.runs[PL.run_count++] = (NvkRunDesc){ R.run_first, R.run_end, (uint8_t)plane_index, (uint8_t)R.run_merged };
+        return 0;
+    }
+    if (PL.active < 0) return 0;
+    const uint32_t j = PL.ordinal++;
+    const NvkRunDesc *run = &PL.runs[j < PL.run_count ? j : 0u];
+    const NvkPrePlan *pp = &PL.chunks[PL.active].runs[j < PL.run_count ? j : 0u];
+    const unsigned expected = run->plane == PL.work->phase_chunks[1].commands[0].plane
+        ? PL.work->phase_chunks[PL.active].commands[0].plane : run->plane;
+    int match = j < PL.run_count && run->first == R.run_first && run->end == R.run_end && expected == plane_index &&
+        run->merged == (uint8_t)R.run_merged && pp->result == 2 && pp->ncmd == ncmd;
+    for (uint32_t ci = 0u; match && ci < ncmd; ++ci)
+        match = pp->cmd[ci].vertex == s_sched_src[ci].vertex && pp->cmd[ci].prepared == s_sched_src[ci].prepared &&
+            s_sched_src[ci].prepared != NULL;
+    if (!match) { ++PL.rejected; return 0; }
+    NativeSchedState *sched = &s_sched;
+    const NvkPlanResult *plan = &pp->plan;
+    if (!nvk_sched_reserve((void **)&sched->prim, &sched->prim_cap, plan->prim_count ? plan->prim_count : 1u, sizeof(*sched->prim)) ||
+        !nvk_sched_reserve((void **)&sched->shape, &sched->shape_cap, plan->shape_count ? plan->shape_count : 1u, sizeof(*sched->shape)) ||
+        !nvk_sched_reserve((void **)&sched->layer, &sched->layer_cap, plan->total, sizeof(*sched->layer)) ||
+        !nvk_sched_reserve((void **)&s_sched_depth_fast, &s_sched_depth_capacity, plan->total, sizeof(*s_sched_depth_fast))) {
+        ++PL.rejected;
+        return 0;
+    }
+    memcpy(sched->prim, pp->prim, (size_t)plan->prim_count * sizeof(*sched->prim));
+    memcpy(sched->shape, pp->shape, (size_t)plan->shape_count * sizeof(*sched->shape));
+    memcpy(sched->layer, pp->layer, (size_t)plan->total * sizeof(*sched->layer));
+    memcpy(s_sched_cmd, pp->cmd, (size_t)ncmd * sizeof(*s_sched_cmd));
+    memcpy(s_sched_depth_fast, pp->depth_fast, (size_t)plan->total * sizeof(*s_sched_depth_fast));
+    *out = *plan;
+    ++PL.taken;
+    return 2;
 }
 
 /* Executes the work. On success the images' readback is mapped in R.readback; with out_fence the
@@ -5209,6 +5973,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     S.pending_work = NULL;
     NVK_LAP(0u);
     /* Planes (GL: the first slice of the work). */
+    for (unsigned i = 0; i < GL_NATIVE_GPU_PHASE_BASE; ++i) R.planes[i].base_seq = 0u;
     for (unsigned i = 0; i < GL_NATIVE_GPU_PLANES && ok; ++i) if (widths[i] && !R.planes[i].color.image) {
         R.planes[i] = S.spare[i];
         memset(&S.spare[i], 0, sizeof(S.spare[i]));
@@ -5223,11 +5988,24 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
                 ok = 0;
                 break;
             }
-            nvk_plane_copy(&S.committed[i], &R.planes[i], 0);
-            if (S.committed[i].has_key) {
-                ok = nvk_plane_depth(&R.planes[i]);
-                if (ok) nvk_plane_copy(&S.committed[i], &R.planes[i], 1);
+            int32_t delta[4];
+            const int known = nvk_committed_delta(&R.planes[i], &S.committed[i], i, delta);
+            if (known >= 0) {
+                nvk_plane_copy_rect(&S.committed[i], &R.planes[i], 0, 3u, known ? delta : NULL);
+                if (S.committed[i].has_key) {
+                    ok = nvk_plane_depth(&R.planes[i]);
+                    if (ok) nvk_plane_copy_rect(&S.committed[i], &R.planes[i], 1, 3u, known ? delta : NULL);
+                }
+            } else {
+                ++P.copy_elided;
+                if (S.committed[i].has_key) nvk_plane_copy_depth_bounds(&S.committed[i], &R.planes[i]);
+                R.planes[i].dirty_all = 1;
             }
+            /* The plane now equals the committed state; track this work's changes. */
+            R.planes[i].content_seq = 0u;
+            R.planes[i].base_seq = S.committed[i].content_seq;
+            R.planes[i].written_all = 0;
+            memset(R.planes[i].written, 0, sizeof(R.planes[i].written));
         }
     }
     /* The words image starts as the work's initial words. */
@@ -5339,6 +6117,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
                 SDL_CondWaitTimeout(s_native_gpu_condition, s_native_state_mutex, 2);
             if (work->cancel_requested || !SDL_AtomicGet(&s_native_gpu_run)) {
                 SDL_UnlockMutex(s_native_state_mutex);
+                nvk_preplan_finish();
                 return 2; /* caller drains submissions before releasing storage */
             }
         }
@@ -5367,8 +6146,12 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
             if (damaged < 0) { ok = 0; break; }
         }
         R.damage_active = damaged;
+        if (ok && sealed) nvk_preplan_begin_chunk(c);
         if (ok && chunk.count && (!damaged || R.damage_count))
             ok = nvk_slice(chunk.commands, chunk.data, 0u, chunk.count, chunk.geometry);
+        if (ok && sealed && c == 1u) nvk_preplan_launch(work, available < work->phase_count ? available : work->phase_count);
+        PL.recording = 0;
+        PL.active = -1;
         nvk_pass_end();
         R.damage_active = 0;
         R.damage_shader_active = 0;
@@ -5377,6 +6160,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
             ok = nvk_submit_partial(VK_NULL_HANDLE);
         }
     }
+    nvk_preplan_finish();
     nvk_pass_end();
     nvk_prof_stamp(7u);
     nvk_prof_stamp(2u);
@@ -5681,12 +6465,7 @@ void native_vk_shadow_apply(const GlNativeGpuWork *work)
     SDL_LockMutex(S.mutex);
     if (S.pending_work == work && !memcmp(&S.pending_identity, &work->identity, sizeof(work->identity))) {
         /* The work's planes become the committed ones; the retired ones are its spares. */
-        for (unsigned i = 0u; i < GL_NATIVE_GPU_PHASE_BASE; ++i) {
-            NvkPlane old = S.committed[i];
-            S.committed[i] = S.work_planes[i];
-            S.work_planes[i] = old;
-        }
-        nvk_planes_to_spare();
+        nvk_commit_planes();
         S.committed_valid = 1;
     } else {
         /* A work the executor did not run was committed on GL: the shadow cannot follow. */
@@ -6143,12 +6922,7 @@ static void nvk_be_plane_extent(const GlNativeGpuWork *work, unsigned plane, uin
 static void nvk_be_apply_planes(GlNativeGpuWork *work)
 {
     (void)work;
-    for (uint32_t i = 0u; i < GL_NATIVE_GPU_PHASE_BASE; ++i) {
-        NvkPlane old = S.committed[i];
-        S.committed[i] = S.work_planes[i];
-        S.work_planes[i] = old;
-    }
-    nvk_planes_to_spare();
+    nvk_commit_planes();
 }
 
 static NvkPlane *nvk_image_ptr(uint64_t handle) { return (NvkPlane *)(uintptr_t)handle; }
@@ -6273,8 +7047,8 @@ int native_vk_endpoint_views(uint64_t color_handle, VkImageView *color, VkImageV
 {
     const NvkPlane *p = nvk_image_ptr(color_handle);
     if (!p || !p->color.image) return 0;
-    *color = p->color.view;
-    *mask = p->alpha_view;
+    *color = p->copied ? p->copy_color_view : p->color.view;
+    *mask = p->copied ? p->copy_alpha_view : p->alpha_view;
     return 1;
 }
 
@@ -6342,6 +7116,7 @@ void native_vk_backend_join(void)
         B.thread = NULL;
         s_native_gpu_thread = NULL;
     }
+    nvk_preplan_stop();
 }
 
 void native_vk_backend_stop(void)
@@ -6432,6 +7207,21 @@ int native_vk_backend_json(char *out, int capacity)
     for (unsigned i = 0u; i < 4u && n < capacity; ++i)
         n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "", detail_names[i],
             (unsigned long long)P.detail_ns[i]);
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "},\"detail_runs\":{");
+    for (unsigned i = 0u; i < 4u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "", detail_names[i],
+            (unsigned long long)P.detail_runs[i]);
+    const char *copy_names[4] = { "base", "snapshot", "seed", "committed" };
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "},\"copy_runs\":{");
+    for (unsigned i = 0u; i < 4u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "", copy_names[i],
+            (unsigned long long)P.copy_runs[i]);
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "}");
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), ",\"copy_elided\":%llu,\"copy_bytes\":{",
+        (unsigned long long)P.copy_elided);
+    for (unsigned i = 0u; i < 4u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "", copy_names[i],
+            (unsigned long long)P.copy_bytes[i]);
     if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "}}}");
     return n;
 }

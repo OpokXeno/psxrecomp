@@ -124,9 +124,15 @@ void reject_unchanged_tile(){
  ivec2 p=ivec2(gl_FragCoord.xy);
  ivec4 clip=ivec4(damage_words[offset+1u],damage_words[offset+2u],damage_words[offset+3u],damage_words[offset+4u]);
  if(any(lessThan(p,clip.xy))||any(greaterThanEqual(p,clip.zw)))discard;
- uint geometry=damage_words[offset],shift=geometry>>16u;
- uint tile=(uint(p.y)>>shift)*(geometry&65535u)+(uint(p.x)>>shift);
- if((damage_words[offset+5u+(tile>>5u)]&(1u<<(tile&31u)))==0u)discard;
+ uint geometry=damage_words[offset],shift=(geometry>>16u)&255u,columns=geometry&65535u,bits=offset+5u,tile;
+ if((geometry&0x80000000u)!=0u){
+  /* Host-grid plane: per-pixel tile columns and rows packed as 16 bits. */
+  uint x=uint(p.x),y=uint(p.y);
+  uint tx=(damage_words[offset+damage_words[offset+5u]+(x>>1u)]>>((x&1u)*16u))&65535u;
+  uint ty=(damage_words[offset+damage_words[offset+6u]+(y>>1u)]>>((y&1u)*16u))&65535u;
+  tile=ty*columns+tx;bits=offset+7u;
+ }else tile=(uint(p.y)>>shift)*columns+(uint(p.x)>>shift);
+ if((damage_words[bits+(tile>>5u)]&(1u<<(tile&31u)))==0u)discard;
 }
 #endif
 #endif

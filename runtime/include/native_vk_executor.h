@@ -10,8 +10,8 @@
  * differently: a work that needs one is refused and counted per feature
  * (NativeVkRefusal).
  *
- * Shadow mode (PSX_NATIVE_VK_SHADOW=1, GL Native only, PSX_NATIVE_GPU_INTERLOCK=0
- * for the GL core tier): after the GL executor has finished a work and its image
+ * Shadow mode (PSX_NATIVE_VK_SHADOW=1, GL Native only, the default
+ * GL core tier): after the GL executor has finished a work and its image
  * digests are known, the Vulkan executor runs the same work synchronously on the
  * GL GPU thread and compares every scanout image with GL's. Debug commands
  * native_vk_shadow / native_vk_shadow_dump report the result. The functions

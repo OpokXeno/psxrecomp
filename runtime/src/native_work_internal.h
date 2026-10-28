@@ -767,7 +767,7 @@ typedef struct GlNativePrefetch {
     uint64_t cpu_ns;
     int leased;
 } GlNativePrefetch;
-#define GL_NATIVE_PREFETCH_CAPACITY 2u
+#define GL_NATIVE_PREFETCH_CAPACITY 3u
 
 typedef struct GlNativeAttributePlanes {
     double x, y;

@@ -28,6 +28,14 @@ typedef struct GlNativeGpuShape {
     /* Immutable edge direction, length and own projection interval. Keep the
      * original division order so separating-axis decisions are unchanged. */
     double edge[3][5]; /* ex, ey, length, minimum, maximum */
+    /* Pixel-centre test data on the last host grid it was used with, filled
+     * lazily by native_gpu_hazard.c: unit inward edge normals and n . vertex,
+     * the grid box, and the page (-1 spans pages, -2 not filled). */
+    double gn[3][3];
+    float gbox[4];
+    double gsx, gsy;
+    uint32_t grows, gpixels;
+    int32_t gpage;
 } GlNativeGpuShape;
 typedef struct GlNativeGpuHazards {
     uint32_t count, big_count, touched_count, columns, rows;
@@ -49,7 +57,14 @@ typedef struct NativeSchedState {
     GlNativeGpuShape *shape; uint32_t *stamp, *touched, *node_shape; int32_t *cell_head, *node_next;
     uint32_t geo_cap, prim_cap, layer_cap, shape_cap, shape_layer_cap, stamp_cap, cell_cap, node_cap, node_next_cap, query;
 } NativeSchedState;
-extern NativeSchedState s_sched;
+extern _Thread_local NativeSchedState s_sched;
+/* The pixel grid the overlap tests evaluate. Inactive: pixel centres at shape
+ * units + 0.5. A host-grid plane rasterizes physical pixels instead: shape
+ * point (x, y) lies at ((x - 0.5) * sx + 0.5, (y - origin - 0.5) * sy + 0.5 +
+ * pixel), as native_gpu.vert places it. origin is the first row of the
+ * page_rows-high page holding the shape and pixel = page * page_pixels. */
+typedef struct NativeHzGrid { int active; double sx, sy; uint32_t page_rows, page_pixels; } NativeHzGrid;
+extern _Thread_local NativeHzGrid g_native_hz_grid;
 
 void native_gpu_hazards_clear(GlNativeGpuHazards *hz);
 int native_gpu_shape_tri(GlNativeGpuShape *s, const float *v0, const float *v1, const float *v2, float off, uint32_t scale);
