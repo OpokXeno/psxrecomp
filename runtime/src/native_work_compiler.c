@@ -195,7 +195,7 @@ void native_work_timing_dump(void) {
     if(!path||!path[0])return;
     FILE *f=fopen(path,"w");
     if(!f)return;
-    fputs("epoch,sequence,vblank,gpu,scale,width,height,commands,phases,digest,begin_ns,compile_cpu_ns,queued_ns,dispatch_begin_ns,dispatch_end_ns,ready_ns,hash_begin_ns,hash_end_ns,hash_cpu_ns,end_ns,service_ns,service_cpu_ns,copy_ns,deadline_ns,previous_vblank,previous_cycle,temporal_status,fresh,operations,native_cpu_ns,phase_cpu_ns,phase_begin_ns,reference_digest,phase_project_cpu_ns,phase_capture_cpu_ns,phase_geometry_cpu_ns,phase_digests,service_prepare_cpu_ns,service_draw_cpu_ns,service_scanout_cpu_ns,canonical_read_cpu_ns,image_alloc_cpu_ns,gpu_setup_triangles\n",f);
+    fputs("epoch,sequence,vblank,gpu,scale,width,height,commands,phases,digest,begin_ns,compile_cpu_ns,queued_ns,dispatch_begin_ns,dispatch_end_ns,ready_ns,hash_begin_ns,hash_end_ns,hash_cpu_ns,end_ns,service_ns,service_cpu_ns,copy_ns,deadline_ns,previous_vblank,previous_cycle,temporal_status,fresh,operations,native_cpu_ns,phase_cpu_ns,phase_begin_ns,reference_digest,phase_project_cpu_ns,phase_capture_cpu_ns,phase_geometry_cpu_ns,phase_digests,service_prepare_cpu_ns,service_draw_cpu_ns,service_scanout_cpu_ns,canonical_read_cpu_ns,image_alloc_cpu_ns,gpu_setup_triangles,gpu_span_ns,gpu_base_ns,gpu_phases_ns,gpu_scanout_ns\n",f);
     const uint64_t first = s_native_work_timing_count > 8192u ? s_native_work_timing_count - 8192u : 0u;
     for(uint64_t i=first;i<s_native_work_timing_count;++i) {
         GlNativeWorkTiming absolute=s_native_work_timing[i % 8192u];
@@ -221,9 +221,11 @@ void native_work_timing_dump(void) {
         if (s_native_phase_hashes_enabled)
             for (uint32_t phase = 0u; phase < t->phases; ++phase)
                 fprintf(f, "%s%016llx", phase ? ":" : "", (unsigned long long)t->phase_digests[phase]);
-        fprintf(f,",%llu,%llu,%llu,%llu,%llu,%u\n",(unsigned long long)t->service_prepare_cpu_ns,
+        fprintf(f,",%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu\n",(unsigned long long)t->service_prepare_cpu_ns,
             (unsigned long long)t->service_draw_cpu_ns,(unsigned long long)t->service_scanout_cpu_ns,
-            (unsigned long long)t->canonical_read_cpu_ns,(unsigned long long)t->image_alloc_cpu_ns,t->gpu_setup_triangles);
+            (unsigned long long)t->canonical_read_cpu_ns,(unsigned long long)t->image_alloc_cpu_ns,t->gpu_setup_triangles,
+            (unsigned long long)t->gpu_span_ns,(unsigned long long)t->gpu_base_ns,
+            (unsigned long long)t->gpu_phases_ns,(unsigned long long)t->gpu_scanout_ns);
     }
     fclose(f);
     path=getenv("PSX_NATIVE_PHASE_OUT");
@@ -402,6 +404,16 @@ int gl_renderer_native_guest_reference_enabled(void) {
             value != NULL && value[0] == '1' ? 1 : 0;
     }
     return s_native_guest_reference_enabled;
+}
+
+/* The raster layout of the last applied Native work (TCP native_raster_layout). */
+void gl_renderer_native_raster_layout(uint32_t out_size[2], float out_scale[2], uint32_t out_page[2]) {
+    if (s_native_state_mutex) SDL_LockMutex(s_native_state_mutex);
+    const GlNativeRasterLayout layout = s_native_raster_layout;
+    if (s_native_state_mutex) SDL_UnlockMutex(s_native_state_mutex);
+    out_size[0] = layout.width; out_size[1] = layout.height;
+    out_scale[0] = layout.scale_x; out_scale[1] = layout.scale_y;
+    out_page[0] = layout.page_rows; out_page[1] = layout.page_pixels;
 }
 
 int gl_renderer_native_capture_guest_reference(
@@ -2140,6 +2152,7 @@ void native_attribute_planes(const XgRenderIrTriangle *triangle,
                           x[2] < x[0] ? 2u : 0u;
     memset(out, 0, sizeof(*out));
     out->x = x[core]; out->y = y[core]; out->integral = !continuous;
+    out->continuous = continuous;
     {
         /* The PS1 never samples a mapping's exclusive-edge texel (gpu_uv.h).
          * The seed bias above lands on it exactly only for unit uv slopes; a
@@ -2180,11 +2193,13 @@ void native_attribute_planes(const XgRenderIrTriangle *triangle,
         const double dx = nx / area, dy = ny / area;
         /* Native UV seed is 1/2 texel. Upscaled affine sampling follows
          * Beetle's 1/(2*S) seed and decreasing-axis 1-1/S compensation.
-         * This is raster-local; PsyQ's authored reversal remains untouched. */
+         * This is raster-local; PsyQ's authored reversal remains untouched.
+         * A continuous plane is sampled at physical pixel centres, the limit
+         * of that rule at any scale: no seed, or 1 for a decreasing axis. */
         const int mirror = a < 2u && ((dx < 0.0 && dy == 0.0) ||
                                       (dy < 0.0 && dx == 0.0));
-        const double bias = a < 2u ? 0.5 / scale +
-            (mirror ? 1.0 - 1.0 / scale : 0.0) : 0.5;
+        const double bias = a >= 2u ? 0.5 : continuous ? (mirror ? 1.0 : 0.0) :
+            0.5 / scale + (mirror ? 1.0 - 1.0 / scale : 0.0);
         out->plane[a][0] = value[a][core] + bias;
         out->plane[a][1] = dx; out->plane[a][2] = dy;
         if (out->integral) {
@@ -2339,59 +2354,6 @@ static int native_filter_tap(GlNativeCpuCompiler *compiler,
         return 1;
     }
     return native_sample_draw_texel(compiler, draw, texture, clut, u, v, out);
-}
-
-static int native_anisotropic_tap(GlNativeCpuCompiler *compiler,
-        const XgSemanticDrawRecord *draw, GlNativeResourceRecord *texture,
-        GlNativeResourceRecord *clut, const uint16_t *native_words,
-        const GlNativeAttributePlanes *attributes, double u, double v,
-        double color[3], int *valid) {
-    const double fu = u - floor(u) - 0.5, fv = v - floor(v) - 0.5;
-    const int du = fu < 0.0 ? -1 : 1, dv = fv < 0.0 ? -1 : 1;
-    const double x = fabs(fu), y = fabs(fv);
-    const double weights[4] = {
-        (1.0 - x) * (1.0 - y), x * (1.0 - y),
-        (1.0 - x) * y, x * y,
-    };
-    uint16_t taps[4];
-    double total = 0.0;
-    color[0] = color[1] = color[2] = 0.0;
-    *valid = 0;
-    for (int i = 0; i < 4; ++i) {
-        if (!native_filter_tap(compiler, draw, texture, clut, native_words,
-                attributes, (int)floor(u) + ((i & 1) ? du : 0),
-                (int)floor(v) + ((i & 2) ? dv : 0), &taps[i]))
-            return 0;
-        if (taps[i]) total += weights[i];
-    }
-    if (total == 0.0) return 1;
-    for (int i = 0; i < 4; ++i) if (taps[i])
-        for (int channel = 0; channel < 3; ++channel)
-            color[channel] += ((taps[i] >> (channel * 5)) & 31) * weights[i] / total;
-    *valid = 1;
-    return 1;
-}
-
-/* Singular-value footprint shared with the GL shader: physical-pixel texel
- * gradients, major-axis span, and at most N samples, only for minification. */
-static int native_anisotropic_span(double ux, double vx, double uy, double vy,
-        int maximum, double *span_u, double *span_v) {
-    const double xx = ux*ux + vx*vx, yy = uy*uy + vy*vy;
-    const double xy = ux*uy + vx*vy;
-    const double major = 0.5 * (xx + yy + sqrt((xx-yy)*(xx-yy) + 4.0*xy*xy));
-    const double minor = fmax(xx + yy - major, 1.0);
-    int count = (int)fmin(16.0, ceil(sqrt(major / minor)));
-    if (count > maximum) count = maximum;
-    if (count < 2) return 1;
-    double dx = 1.0, dy = 0.0;
-    if (fabs(xy) > 0.000001) {
-        dx = xy; dy = major - xx;
-        const double norm = hypot(dx, dy);
-        dx /= norm; dy /= norm;
-    } else if (yy > xx) { dx = 0.0; dy = 1.0; }
-    *span_u = ux*dx + uy*dy;
-    *span_v = vx*dx + vy*dy;
-    return count;
 }
 
 static inline void native_attribute_step(uint32_t q[5], const GlNativeAttributePlanes *attributes) {
@@ -2611,10 +2573,6 @@ static inline int native_render_draw_impl(GlNativeCpuCompiler *compiler,
             gl_renderer_scene_filter_strength();
         const int filter_draw = !canonical && material->textured && target != compiler->native_vram &&
             filter_strength > 0 && (draw->sprite_texture ? s_sprite_filter : s_tex_filter);
-        const int anisotropy = !canonical && material->textured && target != compiler->native_vram &&
-            !draw->sprite_texture &&
-            draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE ?
-            gl_renderer_anisotropy() : 0;
         const int constant_fragment = !material->textured && flat && no_dither &&
             !material->semi_transparent;
         const uint16_t constant_word = (uint16_t)((triangle->vertices[0].r >> 3u) |
@@ -2871,7 +2829,7 @@ static inline int native_render_draw_impl(GlNativeCpuCompiler *compiler,
                         const int value = (q & UINT32_C(0xfffff)) >> 12u;
                         if (a < 2u) {
                             sampled[a] = value;
-                            if (filter_draw || anisotropy > 1) {
+                            if (filter_draw) {
                                 const double phase = (q & UINT32_C(0xfffff)) / 4096.0;
                                 if (a == 0u) continuous_u = phase;
                                 else continuous_v = phase;
@@ -2885,7 +2843,7 @@ static inline int native_render_draw_impl(GlNativeCpuCompiler *compiler,
                             attributes.plane[a][1] * (x - attributes.x) +
                             attributes.plane[a][2] * (y - attributes.y);
                         sampled[a] = floor(phase);
-                        if (a < 2u && (filter_draw || anisotropy > 1)) {
+                        if (a < 2u && filter_draw) {
                             if (a == 0u) continuous_u = phase;
                             else continuous_v = phase;
                         }
@@ -2965,7 +2923,7 @@ static inline int native_render_draw_impl(GlNativeCpuCompiler *compiler,
                      * the two original truncations (modulation /16, then /8
                      * after dithering), without constructing floating-point
                      * filter taps for every canonical fragment. */
-                    if (!filter_draw && anisotropy <= 1) {
+                    if (!filter_draw) {
                         if (direct_texel) {
                             word = texel | (material->mask_set ? UINT16_C(0x8000) : 0u);
                             if (material->semi_transparent && (texel & UINT16_C(0x8000))) {
@@ -3034,79 +2992,6 @@ static inline int native_render_draw_impl(GlNativeCpuCompiler *compiler,
                             for (int channel = 0; channel < 3; ++channel)
                                 filtered5[channel] += ((taps[tap] >> (channel * 5)) & 31) *
                                     weights[tap] / total;
-                    }
-                    if (transition < 0 && anisotropy > 1) {
-                        double ux = attributes.plane[0][1], vx = attributes.plane[1][1];
-                        double uy = attributes.plane[0][2], vy = attributes.plane[1][2];
-                        if (perspective) {
-                            double w[3], reciprocal[3], denominator = 0.0;
-                            for (int i = 0; i < 3; ++i) {
-                                w[i] = (edges[i][0]*x + edges[i][1]*y + edges[i][2]) / area;
-                                reciprocal[i] = perspective_reciprocal[i];
-                                denominator += w[i] * reciprocal[i];
-                            }
-                            if (denominator > 0.0) {
-                                double den_dx = 0.0, den_dy = 0.0;
-                                ux = vx = uy = vy = 0.0;
-                                for (int i = 0; i < 3; ++i) {
-                                    const double sx = edges[i][0] * reciprocal[i] / area;
-                                    const double sy = edges[i][1] * reciprocal[i] / area;
-                                    const double u = triangle->vertices[i].u / 65536.0;
-                                    const double v = triangle->vertices[i].v / 65536.0;
-                                    den_dx += sx; den_dy += sy;
-                                    ux += sx*u; vx += sx*v;
-                                    uy += sy*u; vy += sy*v;
-                                }
-                                ux = (ux - continuous_u * den_dx) / denominator;
-                                vx = (vx - continuous_v * den_dx) / denominator;
-                                uy = (uy - continuous_u * den_dy) / denominator;
-                                vy = (vy - continuous_v * den_dy) / denominator;
-                            }
-                        }
-                        double span_u = 0.0, span_v = 0.0;
-                        const int samples = native_anisotropic_span(ux, vx, uy, vy,
-                            anisotropy, &span_u, &span_v);
-                        if (samples > 1) {
-                            filter_pixel = 1;
-                            double sum[3] = {0.0, 0.0, 0.0};
-                            int valid = 0;
-                            for (int i = 0; i < samples; ++i) {
-                                const double offset = ((i + 0.5) / samples) - 0.5;
-                                double color[3] = {0.0, 0.0, 0.0};
-                                int sampled_valid = 0;
-                                int fetched = 1;
-                                if (filter_draw) {
-                                    fetched = native_anisotropic_tap(compiler, draw,
-                                        texture_resource, clut_resource, native_words,
-                                        &attributes, shifted_u + offset*span_u,
-                                        shifted_v + offset*span_v, color, &sampled_valid);
-                                } else {
-                                    uint16_t tap;
-                                    fetched = native_filter_tap(compiler, draw,
-                                        texture_resource, clut_resource, native_words,
-                                        &attributes, (int)floor(shifted_u + offset*span_u),
-                                        (int)floor(shifted_v + offset*span_v), &tap);
-                                    if (fetched && tap) {
-                                        for (int channel = 0; channel < 3; ++channel)
-                                            color[channel] = (tap >> (channel * 5)) & 31;
-                                        sampled_valid = 1;
-                                    }
-                                }
-                                if (!fetched) {
-                                    native_audit_block(compiler->audit,
-                                        GL_RENDERER_NATIVE_BLOCKER_TEXTURE_DESCRIPTOR,
-                                        record_index, draw->texture_resource_id,
-                                        draw->texture_generation);
-                                    return 0;
-                                }
-                                if (!sampled_valid) continue;
-                                for (int channel = 0; channel < 3; ++channel)
-                                    sum[channel] += color[channel];
-                                ++valid;
-                            }
-                            if (valid) for (int channel = 0; channel < 3; ++channel)
-                                filtered5[channel] = sum[channel] / valid;
-                        }
                     }
                     /* Raw texture and undithered neutral modulation preserve
                      * RGB555 exactly. Keep the texel's mask/blend bit, without
@@ -9773,6 +9658,7 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         (cycles % UINT64_C(33868800)) * UINT64_C(1000000000) / UINT64_C(33868800);
     uint32_t denominator = native_phase_denominator(
         interval, temporal_hz, GL_NATIVE_MOTION_PHASE_CAPACITY + 1u);
+    s_native_compiler_diag.phase_requested += denominator - 1u;
     /* Request the actual cadence on every source. A late source must not leave
      * later sources capped at one phase for seconds. Estimate this batch from
      * measured computation cost and its remaining accepted deadline instead. */
@@ -9786,7 +9672,19 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         const uint64_t fit = per_phase && available > margin + fixed
             ? (available - margin - fixed) / per_phase : 1u;
         const uint64_t budget_denom = fit ? fit + 1u : 2u;
-        if (denominator > budget_denom) denominator = (uint32_t)budget_denom;
+        if (denominator > budget_denom) {
+            s_native_compiler_diag.phase_budget_cut += denominator - (uint32_t)budget_denom;
+            denominator = (uint32_t)budget_denom;
+        }
+    }
+    {
+        /* GPU-side counterpart of the CPU estimate above: no more phases than
+         * recent batches made selectable before they were due. */
+        const uint32_t cap = xg_render_worker_phase_cap();
+        if (cap && denominator > cap + 1u) {
+            s_native_compiler_diag.phase_cap_cut += denominator - (cap + 1u);
+            denominator = cap + 1u;
+        }
     }
     /* Non-const: a tick deadline can time-box generation to fewer phases
      * (partial publish below reassigns both to the rendered prefix). */
@@ -9947,6 +9845,7 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
              * at 240 Hz ticks a 7-phase batch rarely fits its deadline,
              * and discarding 4 rendered phases produced the all-whole
              * output (phased 0/s) plus the wasted renders. */
+            s_native_compiler_diag.phase_deadline_cut += phase_count - phase;
             phase_count = phase;
             interval = interval * (uint64_t)phase / denominator;
             s_native_phase_budget = phase;
@@ -11095,7 +10994,12 @@ static GlNativeGpuWork *native_gpu_work_create(XgRenderSourceCommitHandle commit
         ? (GlNativeRasterLayout){base_gpu->render_width, base_gpu->render_height,
             base_gpu->raster_scale[0], base_gpu->raster_scale[1], base_gpu->raster_page_rows, base_gpu->raster_page_pixels}
         : s_native_raster_layout;
-    gpu->fresh = scale != base_scale || !native_raster_layout_equal(&raster, &base_raster) ||
+    /* A new framebuffer alias only moves physical rows; the backend carries
+     * the resident full-resolution planes over instead of reseeding them from
+     * the logical grid, which would lose every host-grid pixel kept in VRAM. */
+    GlNativeRasterLayout alias = raster;
+    alias.page_rows = base_raster.page_rows; alias.page_pixels = base_raster.page_pixels;
+    gpu->fresh = scale != base_scale || !native_raster_layout_equal(&alias, &base_raster) ||
         gpu->canonical_gpu != (base_gpu ? base_gpu->canonical_gpu : s_native_gpu_canonical) ||
         base_views->width != audit->header.display.native_width ||
         base_views->offset != audit->header.display.native_offset_x ||

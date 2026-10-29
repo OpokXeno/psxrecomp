@@ -172,18 +172,27 @@ layout(constant_id=24) const int material_aniso_gather=0;
 layout(constant_id=25) const int material_damage=0;
 layout(constant_id=26) const int material_hardware_aniso=0;
 #define decoded_on material_decoded
+#ifdef NATIVE_GPU_CORE_BATCH
+/* Batches carry raw/semi/blend and the depth keep per triangle in record[1].w. */
+#define state ivec4(material_textured,int(triangle_data[1].w&1u),int((triangle_data[1].w>>1u)&1u),int((triangle_data[1].w>>2u)&3u))
+#else
 #define state ivec4(material_textured,material_raw,material_semi,material_blend)
+#endif
 #define flags ivec4(material_mask_set,material_mask_check,material_dither,material_transfer)
 #define texture_filter material_filter
 #define anisotropy material_aniso
 #define hd_on material_hd
 #define mip_on material_mip
+#ifdef NATIVE_GPU_CORE_BATCH
+#define depth_state ivec4(material_test,material_depth_write,int((triangle_data[1].w>>4u)&1u),material_depth_bias)
+#else
 #define depth_state ivec4(material_test,material_depth_write,material_keep,material_depth_bias)
+#endif
 #ifdef NATIVE_GPU_CORE_BATCH
 #undef depth_plane
 #undef attribute_origin
 #define depth_plane ivec4(ivec3(triangle_data[1].xyz),material_depth_scale)
-#define attribute_origin vec4(uintBitsToFloat(triangle_data[2].xy),material_attribute,material_flat)
+#define attribute_origin uintBitsToFloat(triangle_data[2])
 #else
 #define depth_plane ivec4(depth_plane.xyz,material_depth_scale)
 #define attribute_origin vec4(attribute_origin.xy,material_attribute,material_flat)
@@ -309,12 +318,15 @@ uint destination_key(){return DEST_DEPTH().r;}
 #endif
 #define REJECT_PIXEL discard
 #endif
+// Continuous (host-grid) planes are evaluated at physical pixel centres;
+// the others at the pixel corner their Beetle-style seed expects.
+vec2 attribute_fragment(){return gl_FragCoord.xy+vec2(attribute_origin.z==3.0?0.5:0.0);}
 float attribute_sample(int a){
 #if defined(NATIVE_GPU_INTERLOCK) && !defined(NATIVE_GPU_GENERIC_RASTER)
  if(parameters_on!=0){uvec4 v=texelFetch(parameters,(parameter_index-parameter_base)*14+9+a);
   if(attribute_origin.z==1.0){ivec2 delta=ivec2(floor(native_raster_position(gl_FragCoord.xy)))-ivec2(attribute_origin.xy*size.w);
    uint q=v.x+v.y*uint(delta.x)+v.z*uint(delta.y);return float(q&1048575u)/4096.0;}
-  vec3 p=uintBitsToFloat(v.xyz);vec2 delta=native_raster_delta(gl_FragCoord.xy,attribute_origin.xy*size.w)/size.w;
+  vec3 p=uintBitsToFloat(v.xyz);vec2 delta=native_raster_delta(attribute_fragment(),attribute_origin.xy*size.w)/size.w;
   return p.x+dot(p.yz,delta);}
 #endif
  if(attribute_origin.z==1.0){
@@ -322,7 +334,7 @@ float attribute_sample(int a){
   uvec3 p=uvec3(attribute_dda[a].xyz); uint q=p.x+p.y*uint(delta.x)+p.z*uint(delta.y);
   return float(q&1048575u)/4096.0;
  }
- vec2 delta=native_raster_delta(gl_FragCoord.xy,attribute_origin.xy*size.w)/size.w;
+ vec2 delta=native_raster_delta(attribute_fragment(),attribute_origin.xy*size.w)/size.w;
  return attribute_plane[a].x+dot(attribute_plane[a].yz,delta);
 }
 float attribute_at(int a){return floor(attribute_sample(a));}

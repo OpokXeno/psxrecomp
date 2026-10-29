@@ -3340,15 +3340,6 @@ void gl_renderer_set_scene_filter_strength(int percent) {
 int gl_renderer_scene_filter_strength(void) {
     return SDL_AtomicGet(&s_scene_filter_strength);
 }
-static SDL_atomic_t s_scene_anisotropy;
-void gl_renderer_set_anisotropy(int samples) {
-    if (samples != 2 && samples != 4 && samples != 8 && samples != 16)
-        samples = 0;
-    SDL_AtomicSet(&s_scene_anisotropy, samples);
-}
-int gl_renderer_anisotropy(void) {
-    return SDL_AtomicGet(&s_scene_anisotropy);
-}
 static SDL_atomic_t s_debug_mipmaps;
 void gl_renderer_set_debug_mipmaps(int enabled) {
     SDL_AtomicSet(&s_debug_mipmaps, enabled ? 1 : 0);
@@ -7117,8 +7108,6 @@ static int native_gpu_render_layer(GlNativeGpuWork *work, const GlNativeGpuComma
         const int filter_strength = draw->sprite_texture ? 100 :
             gl_renderer_scene_filter_strength();
         const float strength_value=filter_strength/100.f;
-        const int anisotropy_option = command->plane != 0u && !lines && !draw->sprite_texture &&
-            draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE ? gl_renderer_anisotropy() : 0;
         const int debug_mipmaps = gl_renderer_debug_mipmaps();
         const int batched = s_native_gpu_interlock && !wire && !draw->hd_texture.valid && !command->source &&
             !debug_mipmaps;
@@ -7147,10 +7136,9 @@ static int native_gpu_render_layer(GlNativeGpuWork *work, const GlNativeGpuComma
                 }
                 m = &material;
             }
-            const int anisotropy_value = m->textured ? anisotropy_option : 0;
-            const int uv_gradient = !lines && (anisotropy_value>1 || (command->plane!=0u && m->textured &&
+            const int uv_gradient = !lines && command->plane!=0u && m->textured &&
                 !draw->sprite_texture && draw->screen_space_2d==GPU_RENDER_SCREEN_SPACE_2D_NONE &&
-                debug_mipmaps));
+                debug_mipmaps;
             GlNativeGpuDrawGeometry local;
             const GlNativeGpuDrawGeometry *geometry = prepared ? &prepared[t] : &local;
             if (!prepared) native_gpu_prepare_draw(work, command, captured_data, t, plane->width / scale,
@@ -7201,7 +7189,7 @@ static int native_gpu_render_layer(GlNativeGpuWork *work, const GlNativeGpuComma
                 p_glUniform1f(s_native_gpu_filter_strength,strength_value);
                 s_native_gpu_strength_value=strength_value;
             }
-            native_gpu_uniform1(NATIVE_UNIFORM_ANISOTROPY,s_native_gpu_anisotropy,anisotropy_value);
+            native_gpu_uniform1(NATIVE_UNIFORM_ANISOTROPY,s_native_gpu_anisotropy,0);
             if (wire) {
                 /* Unlit constant lines (the transfer path of the shader). */
                 native_gpu_uniform4(1,s_native_gpu_flags,0,0,0,1);

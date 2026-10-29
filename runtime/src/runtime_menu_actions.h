@@ -32,7 +32,7 @@ enum RuntimeMenuSetting {
     MENU_ASPECT = 1u << 0, MENU_WINDOW_SIZE = 1u << 1,
     MENU_FULLSCREEN = 1u << 2, MENU_VSYNC = 1u << 3,
     MENU_SCALE = 1u << 4, MENU_TEXTURE_FILTER = 1u << 5,
-    MENU_SPRITE_FILTER = 1u << 6, MENU_ANISOTROPY = 1u << 7,
+    MENU_SPRITE_FILTER = 1u << 6,
     MENU_ANTIALIASING = 1u << 8, MENU_AA_FACTOR = 1u << 9,
     MENU_FPS = 1u << 10, MENU_DITHERING = 1u << 11,
     MENU_SCREEN_MODEL = 1u << 12, MENU_Z_BUFFER = 1u << 13,

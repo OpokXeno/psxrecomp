@@ -122,6 +122,89 @@ uint32_t native_gpu_command_vertex_count(const GlNativeGpuCommand *command) {
     return command->kind == NATIVE_GPU_SEED || command->kind == NATIVE_GPU_SPAN ? 6u : 0u;
 }
 
+/* TCP native_draw_probe: once armed, the prepared triangles of the first
+ * endpoint work (kind 0) and the first phase work (kind 1) that follow, so
+ * one sprite's setup can be compared between both paths. */
+#define NATIVE_DRAW_PROBE_CAPACITY 2048u
+typedef struct NativeDrawProbeRecord {
+    uint32_t plane, command_y, textured, integral, continuous;
+    float vertex[3][4], weight[3];
+    double origin[2], u[3], v[3];
+    int bounds[4];
+} NativeDrawProbeRecord;
+typedef struct NativeDrawProbeKind {
+    const GlNativeGpuWork *work;
+    uint32_t count, render_width, render_height, phase_crop_x, phase_crop_y, scanout_x, scanout_offset;
+    float raster_scale[2];
+    NativeDrawProbeRecord records[NATIVE_DRAW_PROBE_CAPACITY];
+} NativeDrawProbeKind;
+static SDL_SpinLock s_draw_probe_lock;
+static int s_draw_probe_armed;
+static NativeDrawProbeKind s_draw_probe[2];
+
+void native_draw_probe_arm(void) {
+    SDL_AtomicLock(&s_draw_probe_lock);
+    memset(s_draw_probe, 0, sizeof(s_draw_probe));
+    s_draw_probe_armed = 1;
+    SDL_AtomicUnlock(&s_draw_probe_lock);
+}
+
+/* JSON for kind's header and records [offset, offset + count); 0 on overflow. */
+size_t native_draw_probe_json(unsigned kind, uint32_t offset, uint32_t count, char *buffer, size_t capacity) {
+    if (kind > 1u || !buffer || !capacity) return 0u;
+    SDL_AtomicLock(&s_draw_probe_lock);
+    const NativeDrawProbeKind *k = &s_draw_probe[kind];
+    size_t used = (size_t)snprintf(buffer, capacity,
+        "\"captured\":%d,\"total\":%u,\"render\":[%u,%u],\"raster_scale\":[%.9g,%.9g],"
+        "\"phase_crop\":[%u,%u],\"scanout_x\":%u,\"scanout_offset\":%u,\"records\":[",
+        k->work != NULL, k->count, k->render_width, k->render_height, k->raster_scale[0], k->raster_scale[1],
+        k->phase_crop_x, k->phase_crop_y, k->scanout_x, k->scanout_offset);
+    for (uint32_t i = offset; i < k->count && i < offset + count && used < capacity; ++i) {
+        const NativeDrawProbeRecord *r = &k->records[i];
+        used += (size_t)snprintf(buffer + used, capacity - used,
+            "%s{\"plane\":%u,\"y\":%u,\"tex\":%u,\"integral\":%u,\"continuous\":%u,"
+            "\"xy\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g],\"uv\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g],"
+            "\"weight\":[%.9g,%.9g,%.9g],\"origin\":[%.9g,%.9g],\"u\":[%.9g,%.9g,%.9g],\"v\":[%.9g,%.9g,%.9g],\"bounds\":[%d,%d,%d,%d]}",
+            i > offset ? "," : "", r->plane, r->command_y, r->textured, r->integral, r->continuous,
+            r->vertex[0][0], r->vertex[0][1], r->vertex[1][0], r->vertex[1][1], r->vertex[2][0], r->vertex[2][1],
+            r->vertex[0][2], r->vertex[0][3], r->vertex[1][2], r->vertex[1][3], r->vertex[2][2], r->vertex[2][3],
+            r->weight[0], r->weight[1], r->weight[2], r->origin[0], r->origin[1], r->u[0], r->u[1], r->u[2], r->v[0], r->v[1], r->v[2],
+            r->bounds[0], r->bounds[1], r->bounds[2], r->bounds[3]);
+    }
+    if (used < capacity) used += (size_t)snprintf(buffer + used, capacity - used, "]");
+    SDL_AtomicUnlock(&s_draw_probe_lock);
+    return used < capacity ? used : 0u;
+}
+
+static void native_draw_probe_record(const GlNativeGpuWork *work, const GlNativeGpuCommand *command,
+        const float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOATS], const GlNativeTriangleFlags *flags,
+        const GlNativeGpuDrawGeometry *out) {
+    /* The phase template capture is not a phase: its draws reach phases as TEMPLATE. */
+    if (work->capture_templates) return;
+    SDL_AtomicLock(&s_draw_probe_lock);
+    NativeDrawProbeKind *k = &s_draw_probe[work->wave_phase > 0.0 ? 1u : 0u];
+    if (s_draw_probe_armed && !k->work) {
+        k->work = work; k->render_width = work->render_width; k->render_height = work->render_height;
+        k->phase_crop_x = work->phase_crop_x; k->phase_crop_y = work->phase_crop_y;
+        k->scanout_x = work->scanout_x; k->scanout_offset = work->scanout_offset;
+        k->raster_scale[0] = work->raster_scale[0]; k->raster_scale[1] = work->raster_scale[1];
+    }
+    if (s_draw_probe_armed && k->work == work && k->count < NATIVE_DRAW_PROBE_CAPACITY) {
+        NativeDrawProbeRecord *r = &k->records[k->count++];
+        r->plane = command->plane; r->command_y = command->y; r->textured = flags->textured;
+        r->integral = (uint32_t)out->attributes.integral; r->continuous = (uint32_t)out->attributes.continuous;
+        for (unsigned v = 0u; v < 3u; ++v) {
+            memcpy(r->vertex[v], vertices[v], sizeof(r->vertex[v]));
+            r->weight[v] = vertices[v][GL_NATIVE_GPU_VERTEX_WEIGHT];
+        }
+        r->origin[0] = out->attributes.x; r->origin[1] = out->attributes.y;
+        memcpy(r->u, out->attributes.plane[0], sizeof(r->u));
+        memcpy(r->v, out->attributes.plane[1], sizeof(r->v));
+        r->bounds[0] = out->left; r->bounds[1] = out->top; r->bounds[2] = out->right; r->bounds[3] = out->bottom;
+    }
+    SDL_AtomicUnlock(&s_draw_probe_lock);
+}
+
 void native_gpu_prepare_draw(const GlNativeGpuWork *work,
         const GlNativeGpuCommand *command, const uint8_t *blob, uint32_t triangle,
         uint32_t width, uint32_t height,
@@ -190,6 +273,7 @@ void native_gpu_prepare_draw(const GlNativeGpuWork *work,
     }
     out->left = left; out->top = top; out->right = right; out->bottom = bottom;
     out->visible = 1;
+    if (s_draw_probe_armed && !lines) native_draw_probe_record(work, command, vertices, &flags, out);
 }
 
 int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,

@@ -468,7 +468,6 @@ auto_skip_fmv = false     # legacy Settings/runtime default
 offer_skip_fmv = true     # false when the game exposes this through Mods
 texture_filtering = "nearest" # scene surfaces: "nearest" or "bilinear"
 sprite_filtering = "nearest"  # sprite/UI art, independently selectable
-anisotropic_filtering = 0     # Native 3D scene textures: 0 (Off), 2, 4, 8, 16
 ```
 
 `renderer = "vulkan"` remains an experimental runtime choice and still requires
@@ -509,14 +508,6 @@ for Native scene textures and sprite/UI art independently. Both default to
 `nearest` and may be overridden in `settings.toml` or via the launcher. Native
 presentation applies these filters after guest VRAM rendering, so changing them
 does not alter the game's VRAM content.
-`anisotropic_filtering` is an independent Native OpenGL 3D scene quality setting,
-defaulting to Off. It takes up to 2/4/8/16 samples along the elongated
-texel-space footprint of an angled/minified surface: point samples with
-`texture_filtering = "nearest"`, bilinear samples with `"bilinear"`.
-The 25% scene bilinear strength affects only the latter. Sprites/UI and
-canonical guest VRAM are unaffected. This manually samples the PS1 atlas
-within each primitive's UV limits, rather than relying on OpenGL's sampler
-anisotropy. The debug-only mipmap experiment below is separate.
 
 The experimental **Generate texture mipmaps** checkbox is available only in
 the Native debug overlay. It defaults to Off and has no `[video]` or launcher

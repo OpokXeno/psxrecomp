@@ -341,13 +341,9 @@ static int vkc_create_instance(uint32_t *app_version_out)
     free(avail);
     if (have_debug_utils) exts[ext_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
 
-    int want_validation = 0;
+    /* The Khronos validation layer is opt-in in every build (PSX_VK_VALIDATION=1). */
     const char *venv = getenv("PSX_VK_VALIDATION");
-#if defined(NDEBUG)
-    want_validation = venv && !strcmp(venv, "1");
-#else
-    want_validation = (venv && !strcmp(venv, "1")) || !(venv && !strcmp(venv, "0"));
-#endif
+    const int want_validation = venv && !strcmp(venv, "1");
     const char *layers[1];
     uint32_t layer_count = 0;
     if (want_validation && have_debug_utils) {

@@ -655,12 +655,6 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] sprite_filtering must be \"nearest\" or \"bilinear\": {}", mode));
         }
-        if (video.contains("anisotropic_filtering")) {
-            const int n = toml::find<int>(video, "anisotropic_filtering");
-            if (n != 0 && n != 2 && n != 4 && n != 8 && n != 16)
-                throw std::runtime_error("[video] anisotropic_filtering must be 0, 2, 4, 8 or 16");
-            rt.video_anisotropic_filtering = n;
-        }
         if (video.contains("renderer")) {
             const auto mode = toml::find<std::string>(video, "renderer");
             if (mode == "software")     rt.video_renderer = 0;
@@ -2492,12 +2486,6 @@ UserSettings load_user_settings(const fs::path& path) {
             if (m == "nearest") { s.sprite_filter = 0; s.has_sprite_filter = true; }
             else if (m == "bilinear") { s.sprite_filter = 1; s.has_sprite_filter = true; }
         });
-        if (v.contains("anisotropic_filtering")) try_get([&]{
-            const int n = toml::find<int>(v, "anisotropic_filtering");
-            if (n == 0 || n == 2 || n == 4 || n == 8 || n == 16) {
-                s.anisotropic_filtering = n; s.has_anisotropic_filtering = true;
-            }
-        });
         if (v.contains("geometry_correction")) try_get([&]{
             s.geometry_correction = toml::find<bool>(v, "geometry_correction");
             s.has_geometry_correction = true;
@@ -2915,8 +2903,6 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
     if (s.has_sprite_filter)
         f << "sprite_filtering  = \"" << (s.sprite_filter ? "bilinear" : "nearest") << "\"\n";
-    if (s.has_anisotropic_filtering)
-        f << "anisotropic_filtering = " << s.anisotropic_filtering << "\n";
     if (s.has_geometry_correction)
         f << "geometry_correction   = "
           << (s.geometry_correction ? "true" : "false") << "\n";

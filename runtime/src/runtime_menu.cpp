@@ -450,9 +450,6 @@ void video_menu() {
         const int filter_values[] = {0, 1};
         choice("Texture filtering", gr_texture_filter(), filters, filter_values, 2, gr_set_texture_filter, MENU_TEXTURE_FILTER);
         choice("Sprite filtering", gl_renderer_sprite_filter(), filters, filter_values, 2, gl_renderer_set_sprite_filter, MENU_SPRITE_FILTER);
-        const char* aniso_names[] = {"Off", "2x", "4x", "8x", "16x"};
-        const int aniso_values[] = {0, 2, 4, 8, 16};
-        choice("Anisotropic filtering", gl_renderer_anisotropy(), aniso_names, aniso_values, 5, gl_renderer_set_anisotropy, MENU_ANISOTROPY);
         toggle("Dithering", gpu_dithering_enabled(), gpu_dithering_set, MENU_DITHERING);
         const char* aa_names[] = {"Off", "FXAA", "SMAA", "TAA", "MSAA", "SSAA"};
         const int aa_values[] = {0, 1, 2, 3, 4, 5};

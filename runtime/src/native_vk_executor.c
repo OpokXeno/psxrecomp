@@ -72,6 +72,10 @@ int native_vk_backend_json(char *out, int capacity)
 {
     return snprintf(out, (size_t)capacity, "{\"running\":0,\"reason\":\"built without Vulkan\"}");
 }
+int native_vk_timeline_json(char *out, int capacity)
+{
+    return snprintf(out, (size_t)capacity, "{\"submits\":[],\"composes\":[]}");
+}
 
 #else  /* PSX_HAVE_VULKAN */
 
@@ -232,7 +236,7 @@ static struct {
     VkSampler sampler_aniso[5];
     struct { uint64_t key; VkPipeline pipeline; } materials[256];
     uint32_t material_count;
-    int specialize_materials, early_reject, sort_materials, sort_hd_readers, aniso_single_tap, aniso_gather;
+    int specialize_materials, early_reject, sort_materials, sort_hd_readers, aniso_gather;
     uint32_t submit_draw_limit;
     int clear_spans;
     int interlock;   /* the interlock tier: storage images, batched parameter records */
@@ -352,7 +356,7 @@ static struct {
     struct NvkTemplatePlan *plan;   /* GL work->template_parameters, of this execution */
     int plan_attempted;
     uint32_t hash_groups;   /* groups of the image fingerprint recorded for this work, 0 = none */
-    uint32_t submit_query;
+    uint32_t submit_query, stat_query;
     uint8_t scanned_images[NVK_IMAGES];
     int damage_active, damage_region;
     uint32_t run_first, run_end;   /* the command range nvk_schedule_sources is planning */
@@ -364,7 +368,7 @@ static struct {
     int32_t damage_rects[128][4], draw_bounds[4];
     int32_t damage_union[4]; /* bounds of damage_rects: x0, y0, x1, y1 */
     unsigned damage_shift;   /* this phase's damage tile */
-    int texture_filter, sprite_filter, anisotropy, filter_strength;
+    int texture_filter, sprite_filter, filter_strength;
     int capture_active, capture_used, capture_eligible;
     int capture_damage_mask;
     uint32_t capture_order;
@@ -376,7 +380,18 @@ static int s_retry_phases;
 
 /* Per-phase cost of the executor, in the native_vk_services JSON: CPU phases of nvk_execute and the
  * GPU time between four timestamps (start, after setup, after the journal, end). */
+/* Why a non-empty core batch was emitted before it filled. */
+enum { NVK_BREAK_FULL, NVK_BREAK_PLANE, NVK_BREAK_KEY_ATTACHED, NVK_BREAK_KEY, NVK_BREAK_SCISSOR, NVK_BREAK_VIEW,
+       NVK_BREAK_MATERIAL, NVK_BREAK_PASS_END, NVK_BREAK_PAGE, NVK_BREAK_LOOSE_DRAW, NVK_BREAK_CLEAR_SPAN,
+       NVK_BREAK_LAYER, NVK_BREAK_RUN_END, NVK_BREAK_COUNT };
+static const char *const s_break_names[NVK_BREAK_COUNT] = { "full", "plane", "key_attached", "key", "scissor", "view",
+    "material", "pass_end", "page", "loose_draw", "clear_span", "layer", "run_end" };
 enum { NVK_CPU_PHASES = 6, NVK_GPU_PHASES = 3, NVK_TS = 8, NVK_CAPTURE_TS = 256, NVK_DETAIL_TS = 2048, NVK_SUBMIT_TS = 2048 };
+/* GPU begin/end of recent timed submissions (PSX_NATIVE_VK_SUBMIT_TIMING),
+ * in device-timestamp nanoseconds, with their work ordinal and phase count. */
+enum { NVK_TIMELINE = 2048 };
+static uint64_t s_submit_timeline[NVK_TIMELINE][4];
+static uint64_t s_submit_timeline_count, s_submit_timeline_works;
 static const char *const s_cpu_phase_names[NVK_CPU_PHASES] = { "begin", "setup", "journal", "scanout", "submit", "complete" };
 static const char *const s_gpu_phase_names[NVK_GPU_PHASES] = { "setup", "journal", "scanout_readback" };
 static struct {
@@ -387,6 +402,7 @@ static struct {
     uint64_t cleared_spans, cleared_rects;
     uint64_t damage_bounds_pixels, capture_pixels, capture_full_pixels;
     uint64_t core_batches, core_batch_triangles, draw_calls;
+    uint64_t batch_breaks[NVK_BREAK_COUNT], batch_key_breaks[16], batch_draw_breaks[24], batch_combo[64];
     _Atomic uint64_t submissions;
     uint64_t raw_vertex_upload_bytes;
     uint64_t narrow_submits, wide_submits;
@@ -396,7 +412,6 @@ static struct {
     uint64_t decoded_hint_hits, decoded_hint_misses, decoded_negative_hits;
     uint64_t decoded_work_full, decoded_slots_full;
     uint64_t descriptor_hint_hits, descriptor_hint_misses;
-    uint64_t aniso_single_tap_triangles;
     uint64_t damage_phases, damage_pixels, damage_full_pixels;
     uint64_t depth_reads_elided;
     uint64_t capture_runs, capture_triangles, capture_retries;
@@ -413,6 +428,7 @@ static struct {
     uint64_t base_gpu_ns, phases_gpu_ns;
     VkQueryPool pool;
     VkQueryPool submit_pool;
+    VkQueryPool stat_pool; uint32_t stat_queries; uint64_t stat_fragments, stat_primitives;
     uint32_t submit_queries;
     uint64_t timed_submits, submit_gpu_ns, submit_gpu_max_ns, submit_timing_overflow;
     int stamped;
@@ -810,9 +826,11 @@ static int nvk_cached_plane_expired(const NvkPlane *p)
 {
     /* Keep the recent working set, rather than every peak phase count the
      * session has ever needed. Auxiliary/late frames can briefly need 15
-     * phases even when normal play settles back to seven. */
+     * phases even when normal play settles back to seven. The window spans
+     * several seconds: the phase cap moves by one or two phases per second,
+     * and expiring targets it soon needs again reallocates 4K images. */
     return p->layout_generation != S.layout_generation ||
-        S.work_sequence - p->last_used_work >= 32u;
+        S.work_sequence - p->last_used_work >= 256u;
 }
 
 /* Called with s_native_state_mutex held, after execution has completed.
@@ -1087,6 +1105,78 @@ static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, i
     destination->dirty_all = 1;
 }
 
+/* Physical row of a virtual row coordinate in plane's page alias layout. */
+static double nvk_relayout_row(const NvkPlane *plane, double virtual_y)
+{
+    const double rows_per_pixel = plane->raster[1];
+    if (!plane->page_rows) return virtual_y / rows_per_pixel;
+    const double page = floor(virtual_y / plane->page_rows);
+    return page * plane->page_pixels + (virtual_y - page * plane->page_rows) / rows_per_pixel;
+}
+
+/* Copy a host-grid plane into one with another framebuffer alias (same
+ * virtual size and scale). Every destination row takes the source row whose
+ * pixel holds the same virtual row centre; rows past a page's virtual extent
+ * hold no guest row and stay untouched. Full-resolution pixels survive. */
+static void nvk_plane_copy_relayout(const NvkPlane *source, NvkPlane *destination, int depth)
+{
+    VkImageCopy regions[256];
+    uint32_t count = 0u;
+    const uint32_t width = source->color.width < destination->color.width ? source->color.width : destination->color.width;
+    const double rows_per_pixel = destination->raster[1];
+    nvk_pass_end();
+    for (uint32_t row = 0u; row < destination->color.height;) {
+        int valid = 0;
+        int32_t shift = 0;
+        {
+            const uint32_t page = destination->page_rows ? row / destination->page_pixels : 0u;
+            const double local = (row + 0.5 - (double)page * destination->page_pixels) * rows_per_pixel;
+            const double virtual_y = (double)page * destination->page_rows + local;
+            if ((!destination->page_rows || local < destination->page_rows) && virtual_y < destination->height) {
+                const double source_row = floor(nvk_relayout_row(source, virtual_y));
+                valid = source_row >= 0.0 && source_row < source->color.height;
+                shift = (int32_t)source_row - (int32_t)row;
+            }
+        }
+        uint32_t end = row + 1u;
+        while (end < destination->color.height) {
+            const uint32_t page = destination->page_rows ? end / destination->page_pixels : 0u;
+            const double local = (end + 0.5 - (double)page * destination->page_pixels) * rows_per_pixel;
+            const double virtual_y = (double)page * destination->page_rows + local;
+            int next_valid = 0;
+            int32_t next_shift = 0;
+            if ((!destination->page_rows || local < destination->page_rows) && virtual_y < destination->height) {
+                const double source_row = floor(nvk_relayout_row(source, virtual_y));
+                next_valid = source_row >= 0.0 && source_row < source->color.height;
+                next_shift = (int32_t)source_row - (int32_t)end;
+            }
+            if (next_valid != valid || (valid && next_shift != shift)) break;
+            ++end;
+        }
+        if (valid) {
+            if (count == sizeof(regions) / sizeof(regions[0])) {
+                vkCmdCopyImage(R.cmd, depth ? source->key.image : source->color.image, VK_IMAGE_LAYOUT_GENERAL,
+                               depth ? destination->key.image : destination->color.image, VK_IMAGE_LAYOUT_GENERAL,
+                               count, regions);
+                count = 0u;
+            }
+            VkImageCopy *r = &regions[count++];
+            memset(r, 0, sizeof(*r));
+            r->srcSubresource = r->dstSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+            r->srcOffset = (VkOffset3D){ 0, (int32_t)row + shift, 0 };
+            r->dstOffset = (VkOffset3D){ 0, (int32_t)row, 0 };
+            r->extent = (VkExtent3D){ width, end - row, 1u };
+        }
+        row = end;
+    }
+    if (count) vkCmdCopyImage(R.cmd, depth ? source->key.image : source->color.image, VK_IMAGE_LAYOUT_GENERAL,
+                              depth ? destination->key.image : destination->color.image, VK_IMAGE_LAYOUT_GENERAL,
+                              count, regions);
+    nvk_barrier_all();
+    destination->written_all = 1;
+    destination->dirty_all = 1;
+}
+
 /* ---- command buffers -------------------------------------------------------------------------------------------- */
 /* A work records into several command buffers: the first part is submitted while the CPU records the rest,
  * so the GPU starts before the journal is fully recorded. They are reset when the next work starts. */
@@ -1124,6 +1214,14 @@ static int nvk_cmd_begin(void)
             P.submit_queries += 2u;
             vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P.submit_pool, R.submit_query);
         } else ++P.submit_timing_overflow;
+    }
+    R.stat_query = UINT32_MAX;
+    if (P.stat_pool) {
+        if (R.cmd_used == 1u) { P.stat_queries = 0u; vkCmdResetQueryPool(R.cmd, P.stat_pool, 0u, NVK_SUBMIT_TS); }
+        if (P.stat_queries < NVK_SUBMIT_TS) {
+            R.stat_query = P.stat_queries++;
+            vkCmdBeginQuery(R.cmd, P.stat_pool, R.stat_query, 0u);
+        }
     }
     return 1;
 }
@@ -1287,6 +1385,8 @@ static int nvk_submit_partial(VkFence fence)
     nvk_pass_end();
     if (R.submit_query != UINT32_MAX)
         vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P.submit_pool, R.submit_query + 1u);
+    if (R.stat_query != UINT32_MAX) vkCmdEndQuery(R.cmd, P.stat_pool, R.stat_query);
+    R.stat_query = UINT32_MAX;
     if (!nvk_ok(vkEndCommandBuffer(R.cmd), "vkEndCommandBuffer")) return 0;
     for (uint32_t i = 0u; i < S.chunk_count && S.chunks[i].cursor; ++i)
         vk_core_buffer_flush(&S.chunks[i].buf, 0, S.chunks[i].cursor);
@@ -1385,11 +1485,12 @@ static unsigned nvk_depth_uniforms(const NvkPlane *plane, const GlNativeDepthMod
 /* ---- render pass control --------------------------------------------------------------------------------- */
 static int nvk_il_flush(void);
 static int nvk_core_batch_flush(void);
+static int nvk_core_batch_break(unsigned why);
 
 static void nvk_pass_end(void)
 {
     if (!R.pass_plane) return;
-    if (!nvk_core_batch_flush()) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_COMMAND, 0u, 0xFEu);
+    if (!nvk_core_batch_break(NVK_BREAK_PASS_END)) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_COMMAND, 0u, 0xFEu);
     if (!nvk_il_flush()) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_COMMAND, 0u, 0xFFu);
     vkCmdEndRenderPass(R.cmd);
     R.pass_plane = NULL;
@@ -1443,7 +1544,7 @@ static int nvk_raster_page(NvkPlane *plane, int y)
     const uint32_t origin = plane->page_rows && y > 0
         ? (uint32_t)y / plane->page_rows * plane->page_rows : 0u;
     if (origin != R.page_y) {
-        if (!nvk_core_batch_flush() || !nvk_il_flush()) return 0;
+        if (!nvk_core_batch_break(NVK_BREAK_PAGE) || !nvk_il_flush()) return 0;
         R.page_y = origin;
         const float pixel = plane->page_rows ? (float)(origin / plane->page_rows * plane->page_pixels) : 0.f;
         const VkViewport viewport = {0.f, pixel, plane->width / plane->raster[0], plane->height / plane->raster[1], 0.f, 1.f};
@@ -1671,6 +1772,7 @@ typedef struct NvkCoreBatch {
     NvkPlane *plane;
     int32_t scissor[4];
     int key_attached;
+    int packed; /* records carry raw/semi/blend/keep: a specialized pipeline only */
     uint32_t triangles;
     uint32_t records[NVK_CORE_BATCH_TRIANGLES][NVK_CORE_TRIANGLE_TEXELS][4];
     float vertices[NVK_CORE_BATCH_TRIANGLES * 3u][GL_NATIVE_GPU_VERTEX_FLOATS];
@@ -1709,6 +1811,9 @@ static int nvk_core_batch_emit(NvkCoreBatch *batch)
     const VkBuffer vertex_buffer = S.chunks[chunk].buf.buffer;
     const VkDeviceSize vertex_offset = offset;
     VkPipeline pipeline = nvk_material_pipeline(batch->key_attached, 1, &batch->draw, &batch->view);
+    /* The generic batch shader takes raw/semi/blend from the material. */
+    if (batch->packed && (pipeline == S.pipe_core_batch[0] || pipeline == S.pipe_core_batch[1] ||
+        pipeline == S.pipe_capture_draw)) return 0;
     if (R.b.pipeline != pipeline) {
         vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         R.b.pipeline = pipeline;
@@ -1739,6 +1844,13 @@ static int nvk_core_batch_emit(NvkCoreBatch *batch)
     const unsigned category = R.capture_active ? 0u : batch->draw.hd_on ? 1u : 2u;
     ++P.batch_draws[category]; P.batch_triangles[category] += triangles;
     return 1;
+}
+
+static int nvk_core_batch_flush(void);
+static int nvk_core_batch_break(unsigned why)
+{
+    if (CB.triangles) ++P.batch_breaks[why];
+    return nvk_core_batch_flush();
 }
 
 static int nvk_core_batch_flush(void)
@@ -1798,6 +1910,21 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
         material.anisotropy = material.texture_filter = 0;
         material.filter_strength = 0.f;
     }
+    /* The attribute mode (continuous/DDA) and flat flag travel in each record
+     * too: one pipeline serves the triangles of every attribute mode. */
+    const float attribute_mode[2] = { material.attribute_origin[2], material.attribute_origin[3] };
+    material.attribute_origin[2] = material.attribute_origin[3] = 0.f;
+    /* So do raw/semi/blend and the semi depth keep: specialized pipelines
+     * read them from record[1].w, whose depth scale is a constant there.
+     * Opaque and semi-transparent triangles then share one batch. */
+    uint32_t blend_bits = 0u;
+    const int packed = S.specialize_materials && !material.depth_view[0] && !R.work->wireframe;
+    if (packed) {
+        blend_bits = (uint32_t)(material.state[1] & 1) | (uint32_t)(material.state[2] & 1) << 1u |
+            (uint32_t)(material.state[3] & 3) << 2u | (uint32_t)(material.depth_state[2] & 1) << 4u;
+        material.state[1] = material.state[2] = material.state[3] = 0;
+        material.depth_state[2] = 0;
+    }
     NvkCoreBatch *batch = &CB;
     if (R.capture_active && S.sort_capture) {
         uint32_t i = 0u;
@@ -1818,9 +1945,46 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
         }
     } else if (CB.triangles && (CB.triangles == NVK_CORE_BATCH_TRIANGLES ||
         !nvk_core_batch_matches(&CB, plane, key_attached, scissor, &material))) {
+        unsigned why = NVK_BREAK_FULL;
+        if (CB.triangles != NVK_CORE_BATCH_TRIANGLES) {
+            why = CB.plane != plane ? NVK_BREAK_PLANE : CB.key_attached != key_attached ? NVK_BREAK_KEY_ATTACHED :
+                memcmp(&CB.key, &R.key, sizeof(R.key)) ? NVK_BREAK_KEY :
+                memcmp(CB.scissor, scissor, sizeof(CB.scissor)) ? NVK_BREAK_SCISSOR :
+                memcmp(&CB.view, &R.v, sizeof(R.v)) ? NVK_BREAK_VIEW : NVK_BREAK_MATERIAL;
+            if (why == NVK_BREAK_KEY) {
+                const void *const *a = (const void *const *)(const void *)&CB.key, *const *b = (const void *const *)(const void *)&R.key;
+                for (unsigned i = 0u; i < sizeof(R.key) / sizeof(void *) && i < 16u; ++i) P.batch_key_breaks[i] += a[i] != b[i];
+            } else if (why == NVK_BREAK_MATERIAL) {
+#define NVK_FIELD_DIFF(i, f) P.batch_draw_breaks[i] += memcmp(&CB.draw.f, &material.f, sizeof(material.f)) != 0
+                NVK_FIELD_DIFF(0, hd_map); NVK_FIELD_DIFF(1, hd_lim); NVK_FIELD_DIFF(2, mip_rect); NVK_FIELD_DIFF(3, sample_lim);
+                NVK_FIELD_DIFF(4, state); NVK_FIELD_DIFF(5, flags); NVK_FIELD_DIFF(6, page); NVK_FIELD_DIFF(7, window);
+                NVK_FIELD_DIFF(8, uv_gradient); NVK_FIELD_DIFF(9, depth_state); NVK_FIELD_DIFF(10, depth_plane);
+                NVK_FIELD_DIFF(11, depth_view); NVK_FIELD_DIFF(12, constant_color); NVK_FIELD_DIFF(13, attribute_origin);
+                NVK_FIELD_DIFF(14, attribute_plane); NVK_FIELD_DIFF(15, attribute_dda); NVK_FIELD_DIFF(16, origin);
+                NVK_FIELD_DIFF(17, depth_origin); NVK_FIELD_DIFF(18, hd_on); NVK_FIELD_DIFF(19, mip_on);
+                NVK_FIELD_DIFF(20, u_depth); NVK_FIELD_DIFF(21, aa_exempt); NVK_FIELD_DIFF(22, texture_filter);
+                NVK_FIELD_DIFF(23, decoded_on);
+#undef NVK_FIELD_DIFF
+                /* Which material groups differ together: state, depth_state, attribute_origin.xy|zw, depth_plane, other. */
+                const unsigned combo = (memcmp(CB.draw.state, material.state, sizeof(material.state)) != 0) |
+                    (memcmp(CB.draw.depth_state, material.depth_state, sizeof(material.depth_state)) != 0) << 1 |
+                    (memcmp(CB.draw.attribute_origin, material.attribute_origin, 2u * sizeof(float)) != 0) << 2 |
+                    (memcmp(CB.draw.attribute_origin + 2, material.attribute_origin + 2, 2u * sizeof(float)) != 0) << 3 |
+                    (memcmp(CB.draw.depth_plane, material.depth_plane, sizeof(material.depth_plane)) != 0) << 4 |
+                    (CB.draw.aa_exempt != material.aa_exempt || CB.draw.u_depth != material.u_depth) << 5;
+                ++P.batch_combo[combo];
+                for (unsigned i = 0u; i < 4u; ++i) {
+                    P.batch_combo[48u + i] += CB.draw.state[i] != material.state[i];
+                    P.batch_combo[52u + i] += CB.draw.depth_state[i] != material.depth_state[i];
+                    P.batch_combo[56u + i] += CB.draw.flags[i] != material.flags[i];
+                }
+            }
+        }
+        ++P.batch_breaks[why];
         if (!nvk_core_batch_flush()) return 0;
     }
     if (!batch->triangles) {
+        batch->packed = packed;
         batch->plane = plane; batch->key_attached = key_attached; batch->key = R.key;
         batch->view = R.v; batch->draw = material;
         memcpy(batch->scissor, scissor, sizeof(batch->scissor));
@@ -1829,7 +1993,9 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
     uint32_t (*record)[4] = batch->records[batch->triangles];
     memcpy(record[0], R.d.sample_lim, 16u);
     memcpy(record[1], R.d.depth_plane, 16u);
-    memcpy(record[2], R.d.attribute_origin, 16u);
+    if (packed) record[1][3] = blend_bits;
+    memcpy(record[2], R.d.attribute_origin, 8u);
+    memcpy(record[2] + 2, attribute_mode, sizeof(attribute_mode));
     memcpy(record[3], R.d.uv_gradient, 16u);
     memcpy(record[4], R.d.depth_origin, 8u);
     record[4][2] = R.capture_active ? ++R.capture_order : 0u;
@@ -1912,7 +2078,7 @@ static int nvk_draw_region_page(NvkPlane *plane, int key_attached, const int32_t
     R.key.capture_meta = R.damage_shader_active && !R.capture_active ? R.damage_buffer : VK_NULL_HANDLE;
     if (S.core_batch && R.batchable && count == 3u) return nvk_core_batch_add(plane, key_attached, scissor, first);
     if (!nvk_require_vertices()) return 0;
-    if (!nvk_core_batch_flush()) return 0;
+    if (!nvk_core_batch_break(NVK_BREAK_LOOSE_DRAW)) return 0;
     VkPipeline pipeline = nvk_material_pipeline(key_attached, 0, &R.d, &R.v);
     if (R.b.pipeline != pipeline) {
         vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -1982,7 +2148,7 @@ static int nvk_damage_intersects(int left, int top, int right, int bottom)
  * The caller has prepared the same target/depth state as the draw path. */
 static int nvk_clear_span(NvkPlane *plane, const GlNativeGpuCommand *command, unsigned depth)
 {
-    if (!nvk_core_batch_flush() || !nvk_il_flush()) return 0;
+    if (!nvk_core_batch_break(NVK_BREAK_CLEAR_SPAN) || !nvk_il_flush()) return 0;
     VkClearRect rects[sizeof(R.damage_rects) / sizeof(R.damage_rects[0])];
     uint32_t count = 0u;
     const int damaged = R.damage_active && plane == &R.planes[R.damage_plane];
@@ -2512,8 +2678,6 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
         const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
         const int filter_strength = draw->sprite_texture ? 100 : R.filter_strength;
         const float strength_value = filter_strength / 100.f;
-        const int anisotropy_option = command->plane != 0u && !lines && !draw->sprite_texture &&
-            draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE ? R.anisotropy : 0;
         int material_valid = 0;
         GlNativeTextureState shared_texture = {0};
         XgRenderIrMaterialState material;
@@ -2542,7 +2706,6 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
                 }
                 m = &material;
             }
-            int anisotropy_value = m->textured ? anisotropy_option : 0;
             GlNativeGpuDrawGeometry local;
             const GlNativeGpuDrawGeometry *geometry = prepared ? &prepared[t] : &local;
             if (!prepared) native_gpu_prepare_draw(work, command, captured_data, t, plane->width / scale,
@@ -2551,32 +2714,6 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
             if (!nvk_damage_intersects(geometry->left * (int)scale, geometry->top * (int)scale,
                     (geometry->right + 1) * (int)scale, (geometry->bottom + 1) * (int)scale)) continue;
             const GlNativeAttributePlanes *attributes = &geometry->attributes;
-            if (S.aniso_single_tap && !TC.active && batched && anisotropy_value > 1 && slice_vertices) {
-                const float (*v)[GL_NATIVE_GPU_VERTEX_FLOATS] = slice_vertices + first_vertex + t * 3u;
-                if (v[0][GL_NATIVE_GPU_VERTEX_WEIGHT] == 0.f && v[1][GL_NATIVE_GPU_VERTEX_WEIGHT] == 0.f &&
-                    v[2][GL_NATIVE_GPU_VERTEX_WEIGHT] == 0.f) {
-                    const float ax = (float)(attributes->plane[0][1] / scale), ay = (float)(attributes->plane[1][1] / scale);
-                    const float bx = (float)(attributes->plane[0][2] / scale), by = (float)(attributes->plane[1][2] / scale);
-                    /* The major eigenvalue cannot exceed the trace. A margin
-                     * below one covers float rounding in the vertex shader:
-                     * these affine triangles provably never take extra taps.
-                     * Specializing them avoids the loop's register footprint. */
-                    const double xx = (double)ax*ax + (double)ay*ay;
-                    const double yy = (double)bx*bx + (double)by*by;
-                    const double trace = xx + yy;
-                    double upper = trace;
-                    if (S.aniso_single_tap == 2 && trace >= 0.98 && trace < 1.96) {
-                        /* The trace bound can reject a magnified footprint
-                         * with two similar axes. Use its major eigenvalue
-                         * only in that narrow ambiguous range; retain the
-                         * same conservative margin and affine-only guard. */
-                        const double xy = (double)ax*bx + (double)ay*by;
-                        upper = 0.5 * (trace + sqrt((xx-yy)*(xx-yy) + 4.0*xy*xy));
-                    }
-                    if (upper < 0.98) { anisotropy_value = 0; ++P.aniso_single_tap_triangles; }
-                }
-            }
-            const int uv_gradient = !lines && (anisotropy_value > 1);
             const GlNativeDepthMode *depth_mode = &geometry->depth;
             const int left = geometry->left, top = geometry->top;
             const int right = geometry->right, bottom = geometry->bottom;
@@ -2596,11 +2733,10 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
             const NvkHd *hd_image = !wire && !snapshot && command->plane != 0u && m->textured && draw->hd_texture.valid
                 ? nvk_hd_lookup(&draw->hd_texture) : NULL;
             VkImageView filtered = VK_NULL_HANDLE;
-            const VkImageView decoded = !command->texture_snapshot && (anisotropy_value <= 1 || snapshot || hd_image)
+            const VkImageView decoded = !command->texture_snapshot
                 ? VK_NULL_HANDLE : nvk_decoded_page(m, command->texture_snapshot, &filtered);
             R.key.filtered = filtered;
-            const uint32_t aniso_index = anisotropy_value >= 16 ? 4u : anisotropy_value >= 8 ? 3u : anisotropy_value >= 4 ? 2u : anisotropy_value >= 2 ? 1u : 0u;
-            R.key.filtered_sampler = filtered ? S.sampler_aniso[aniso_index] : VK_NULL_HANDLE;
+            R.key.filtered_sampler = filtered ? S.sampler_aniso[0] : VK_NULL_HANDLE;
             R.d.decoded_on = decoded ? (S.decode_arrays ? 2 : 1) : 0;
             R.key.decoded = decoded ? decoded : S.dummy_uint.view;
             R.c.depth_tested_triangles += tested ? 1u : 0u;
@@ -2611,19 +2747,16 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
             if (m->textured && !lines)
                 nvk_set4(R.d.sample_lim, attributes->limits[0], attributes->limits[1], attributes->limits[2], attributes->limits[3]);
             nvk_setf4(R.d.attribute_origin, lines ? 0.f : (float)attributes->x, lines ? 0.f : (float)attributes->y,
-                lines ? 0.f : attributes->integral ? 1.f : 2.f,
+                lines ? 0.f : attributes->integral ? 1.f : attributes->continuous ? 3.f : 2.f,
                 native_gpu_command_flags(command, captured_data, t).gouraud ? 0.f : 1.f);
             if (!lines) nvk_attribute_uniforms(attributes);
-            if (uv_gradient)
-                nvk_setf4(R.d.uv_gradient, (float)(attributes->plane[0][1] / scale) * plane->raster[0], (float)(attributes->plane[1][1] / scale) * plane->raster[0],
-                    (float)(attributes->plane[0][2] / scale) * plane->raster[1], (float)(attributes->plane[1][2] / scale) * plane->raster[1]);
             nvk_setf4(R.v.size, (float)plane->width / scale, (float)plane->height / scale, 0.5f / scale - 1.f / 64.f, (float)scale);
             nvk_set4(R.d.state, m->textured, m->raw_texture, m->semi_transparent, m->blend_mode);
             R.d.aa_exempt = draw->aa_exempt || draw->screen_space_2d != GPU_RENDER_SCREEN_SPACE_2D_NONE;
             R.d.texture_filter = command->plane != 0u && filter_strength > 0 &&
                 (draw->sprite_texture ? R.sprite_filter : R.texture_filter);
             R.d.filter_strength = strength_value;
-            R.d.anisotropy = anisotropy_value;
+            R.d.anisotropy = 0;
             if (wire) {
                 /* PSX line primitives already arrive as thin quads; only
                  * triangle primitives need the shader's edge-only coverage. */
@@ -3407,7 +3540,7 @@ static int nvk_schedule_sources(unsigned plane_index, uint32_t ncmd, NvkSchedule
     nvk_pass_begin(plane);
     for (uint32_t layer = 0; layer <= run_max && ok; ++layer) {
         if (layer ? 1 : pre) {
-            if (!nvk_core_batch_flush()) { ok = 0; break; }
+            if (!nvk_core_batch_break(NVK_BREAK_LAYER)) { ok = 0; break; }
             nvk_texture_barrier();
             R.c.destination_barriers++;
             nvk_plane_barrier_clear(plane);
@@ -4184,6 +4317,220 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
 }
 
 /* ---- scanout (GL native_gpu_scanout_*) ---------------------------------------------------------------------------------------- */
+/* TCP native_draw_probe: the scanout spans of the first endpoint image
+ * (kind 0) and phase image (kind 1: a phase image or work) after arming, with their source plane
+ * layout and resolve mapping. path 0 = resolve shader, 1 = image copy. */
+#define NVK_SCAN_PROBE_CAPACITY 128u
+typedef struct NvkScanProbeSpan {
+    uint32_t image, index, path, y, rows, sx, sy, dx, span, width, height, color_width, color_height, page_rows, page_pixels;
+    float raster[4], mapping[4];
+    int32_t rect[4];
+} NvkScanProbeSpan;
+static struct { int armed, done[2]; uint32_t count[2]; NvkScanProbeSpan spans[2][NVK_SCAN_PROBE_CAPACITY]; } s_scan_probe;
+static SDL_SpinLock s_scan_probe_lock;
+
+/* The commands of the first work with phases after arming: list 0 its
+ * base journal, list 1 its phase chunks in execution order, each opened by a
+ * marker entry of kind UINT32_MAX whose data is the chunk's ordinal. */
+#define NVK_COMMAND_PROBE_CAPACITY 4096u
+typedef struct NvkCommandProbe { uint32_t kind, plane, source, data, mask, mesh_count; int x, y, w, h; float sx, sy, sw, sh; } NvkCommandProbe;
+static struct { int pending; uint32_t count[2], total[2]; NvkCommandProbe list[2][NVK_COMMAND_PROBE_CAPACITY]; } s_command_probe;
+
+static void nvk_command_probe_list(unsigned list, const GlNativeGpuCommand *commands, uint32_t count) {
+    s_command_probe.total[list] = count;
+    for (uint32_t i = 0u; i < count && s_command_probe.count[list] < NVK_COMMAND_PROBE_CAPACITY; ++i) {
+        const GlNativeGpuCommand *c = &commands[i];
+        s_command_probe.list[list][s_command_probe.count[list]++] = (NvkCommandProbe){(uint32_t)c->kind, c->plane,
+            c->source, c->data, c->mask, c->mesh_count, c->x, c->y, c->w, c->h, c->sx, c->sy, c->sw, c->sh};
+    }
+}
+
+/* Base journal of the first work after arming (pending 1 -> 2), then the
+ * phase chunks that work executes until the next work starts (2 -> 0). */
+static const GlNativeGpuWork *s_command_probe_work;
+static void nvk_command_probe_work(const GlNativeGpuWork *work, const GlNativeGpuCommand *base, uint32_t base_count) {
+    if (s_command_probe.pending == 2 && work != s_command_probe_work) s_command_probe.pending = 0;
+    if (s_command_probe.pending != 1) return;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    s_command_probe.pending = 2;
+    s_command_probe_work = work;
+    nvk_command_probe_list(0u, base, base_count);
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+}
+
+/* The prepared triangles of that work's phase templates, as the executor
+ * receives them (the templates are captured once and reused across works). */
+typedef struct NvkTemplateProbe {
+    uint32_t command, plane, y, integral, continuous;
+    float vertex[3][4];
+    double origin[2], u[3], v[3];
+    int bounds[4];
+} NvkTemplateProbe;
+static struct { uint32_t count, total; NvkTemplateProbe records[NVK_COMMAND_PROBE_CAPACITY]; } s_template_probe;
+
+static void nvk_template_probe_list(const GlNativePhaseTemplates *cache) {
+    s_template_probe.count = s_template_probe.total = 0u;
+    if (!cache || !cache->geometry || !cache->geometry->primitives) return;
+    const GlNativeGpuGeometry *g = cache->geometry;
+    for (uint32_t c = 0u; c < cache->count; ++c) {
+        const GlNativeGpuCommand *command = &cache->commands[c];
+        if (command->kind != NATIVE_GPU_DRAW || command->draw.topology != GPU_RENDER_SEMANTIC_TRIANGLES) continue;
+        for (uint32_t p = g->offsets[c].primitive, t = 0u; p < g->offsets[c + 1u].primitive; ++p, ++t) {
+            ++s_template_probe.total;
+            if (s_template_probe.count == NVK_COMMAND_PROBE_CAPACITY) continue;
+            const GlNativeGpuDrawGeometry *primitive = &g->primitives[p];
+            NvkTemplateProbe *r = &s_template_probe.records[s_template_probe.count++];
+            r->command = c; r->plane = command->plane; r->y = command->y;
+            r->integral = (uint32_t)primitive->attributes.integral; r->continuous = (uint32_t)primitive->attributes.continuous;
+            for (unsigned v = 0u; v < 3u; ++v) memcpy(r->vertex[v], g->vertices[g->offsets[c].vertex + t * 3u + v], sizeof(r->vertex[v]));
+            r->origin[0] = primitive->attributes.x; r->origin[1] = primitive->attributes.y;
+            memcpy(r->u, primitive->attributes.plane[0], sizeof(r->u));
+            memcpy(r->v, primitive->attributes.plane[1], sizeof(r->v));
+            r->bounds[0] = primitive->left; r->bounds[1] = primitive->top;
+            r->bounds[2] = primitive->right; r->bounds[3] = primitive->bottom;
+        }
+    }
+}
+
+static void nvk_command_probe_chunk(const GlNativeGpuWork *work, const GlNativeGpuChunk *chunk) {
+    if (s_command_probe.pending != 2 || work != s_command_probe_work) return;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    static uint32_t chunks;
+    const uint32_t total = s_command_probe.total[1];
+    if (!total) chunks = 0u;
+    if (s_command_probe.count[1] < NVK_COMMAND_PROBE_CAPACITY)
+        s_command_probe.list[1][s_command_probe.count[1]++] = (NvkCommandProbe){UINT32_MAX, 0u, 0u, chunks};
+    ++chunks;
+    nvk_command_probe_list(1u, chunk->commands, chunk->count);
+    s_command_probe.total[1] += total + 1u;
+    if (!total) nvk_template_probe_list(work->phase_templates);
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+}
+
+size_t nvk_template_probe_json(uint32_t offset, uint32_t count, char *buffer, size_t capacity) {
+    if (!buffer || !capacity) return 0u;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    size_t used = (size_t)snprintf(buffer, capacity, "\"template_total\":%u,\"templates\":[", s_template_probe.total);
+    for (uint32_t i = offset; i < s_template_probe.count && i < offset + count && used < capacity; ++i) {
+        const NvkTemplateProbe *r = &s_template_probe.records[i];
+        used += (size_t)snprintf(buffer + used, capacity - used,
+            "%s{\"command\":%u,\"plane\":%u,\"y\":%u,\"integral\":%u,\"continuous\":%u,"
+            "\"xy\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g],\"uv\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g],"
+            "\"origin\":[%.9g,%.9g],\"u\":[%.9g,%.9g,%.9g],\"v\":[%.9g,%.9g,%.9g],\"bounds\":[%d,%d,%d,%d]}",
+            i > offset ? "," : "", r->command, r->plane, r->y, r->integral, r->continuous,
+            r->vertex[0][0], r->vertex[0][1], r->vertex[1][0], r->vertex[1][1], r->vertex[2][0], r->vertex[2][1],
+            r->vertex[0][2], r->vertex[0][3], r->vertex[1][2], r->vertex[1][3], r->vertex[2][2], r->vertex[2][3],
+            r->origin[0], r->origin[1], r->u[0], r->u[1], r->u[2], r->v[0], r->v[1], r->v[2],
+            r->bounds[0], r->bounds[1], r->bounds[2], r->bounds[3]);
+    }
+    if (used < capacity) used += (size_t)snprintf(buffer + used, capacity - used, "]");
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+    return used < capacity ? used : 0u;
+}
+
+size_t nvk_command_probe_json(unsigned list, uint32_t offset, uint32_t count, char *buffer, size_t capacity) {
+    if (list > 1u || !buffer || !capacity) return 0u;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    size_t used = (size_t)snprintf(buffer, capacity, "\"command_total\":%u,\"commands\":[", s_command_probe.total[list]);
+    for (uint32_t i = offset; i < s_command_probe.count[list] && i < offset + count && used < capacity; ++i) {
+        const NvkCommandProbe *c = &s_command_probe.list[list][i];
+        used += (size_t)snprintf(buffer + used, capacity - used,
+            "%s[%u,%u,%u,%u,%u,%u,%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g]", i > offset ? "," : "",
+            c->kind, c->plane, c->source, c->data, c->mask, c->mesh_count, c->x, c->y, c->w, c->h, c->sx, c->sy, c->sw, c->sh);
+    }
+    if (used < capacity) used += (size_t)snprintf(buffer + used, capacity - used, "]");
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+    return used < capacity ? used : 0u;
+}
+
+/* The RGBA scanout image of the first endpoint and phase after arming. */
+static struct { int pending[2]; uint32_t width[2], height[2]; uint8_t *rgba[2]; } s_image_probe;
+
+void nvk_scan_probe_arm(void) {
+    SDL_AtomicLock(&s_scan_probe_lock);
+    memset(&s_scan_probe, 0, sizeof(s_scan_probe));
+    s_scan_probe.armed = 1;
+    memset(&s_command_probe, 0, sizeof(s_command_probe));
+    s_command_probe.pending = 1;
+    for (unsigned k = 0u; k < 2u; ++k) {
+        free(s_image_probe.rgba[k]);
+        s_image_probe.rgba[k] = NULL; s_image_probe.width[k] = s_image_probe.height[k] = 0u;
+        s_image_probe.pending[k] = 1;
+    }
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+}
+
+static int nvk_image_probe_wants(const GlNativeGpuWork *work, unsigned image) {
+    return s_image_probe.pending[image || work->wave_phase > 0.0 ? 1u : 0u];
+}
+
+static void nvk_image_probe_store(const GlNativeGpuWork *work, unsigned image, const uint8_t *pixels,
+        uint32_t width, uint32_t height) {
+    SDL_AtomicLock(&s_scan_probe_lock);
+    const unsigned kind = image || work->wave_phase > 0.0 ? 1u : 0u;
+    if (s_image_probe.pending[kind] && (s_image_probe.rgba[kind] = malloc((size_t)width * height * 4u))) {
+        memcpy(s_image_probe.rgba[kind], pixels, (size_t)width * height * 4u);
+        s_image_probe.width[kind] = width; s_image_probe.height[kind] = height;
+        s_image_probe.pending[kind] = 0;
+    }
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+}
+
+/* Moves kind's captured RGBA image to the caller (free()); 0 when none. */
+int nvk_image_probe_take(unsigned kind, uint8_t **rgba, uint32_t *width, uint32_t *height) {
+    if (kind > 1u) return 0;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    *rgba = s_image_probe.rgba[kind]; *width = s_image_probe.width[kind]; *height = s_image_probe.height[kind];
+    s_image_probe.rgba[kind] = NULL;
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+    return *rgba != NULL;
+}
+
+static void nvk_scan_probe_span(unsigned image, unsigned index, unsigned path, unsigned y, unsigned rows,
+        unsigned sx, unsigned sy, unsigned dx, unsigned span, const NvkPlane *input, const float mapping[4],
+        const int32_t rect[4]) {
+    if (!s_scan_probe.armed) return;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    const unsigned kind = image || R.work->wave_phase > 0.0 ? 1u : 0u;
+    if (!s_scan_probe.done[kind] && s_scan_probe.count[kind] < NVK_SCAN_PROBE_CAPACITY) {
+        NvkScanProbeSpan *r = &s_scan_probe.spans[kind][s_scan_probe.count[kind]++];
+        *r = (NvkScanProbeSpan){image, index, path, y, rows, sx, sy, dx, span, input->width, input->height,
+            input->color.width, input->color.height, input->page_rows, input->page_pixels};
+        memcpy(r->raster, input->raster, sizeof(r->raster));
+        memcpy(r->mapping, mapping, sizeof(r->mapping));
+        memcpy(r->rect, rect, sizeof(r->rect));
+    }
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+}
+
+static void nvk_scan_probe_finish(unsigned image) {
+    if (!s_scan_probe.armed) return;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    const unsigned kind = image || R.work->wave_phase > 0.0 ? 1u : 0u;
+    if (s_scan_probe.count[kind]) s_scan_probe.done[kind] = 1;
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+}
+
+size_t nvk_scan_probe_json(unsigned kind, char *buffer, size_t capacity) {
+    if (kind > 1u || !buffer || !capacity) return 0u;
+    SDL_AtomicLock(&s_scan_probe_lock);
+    size_t used = (size_t)snprintf(buffer, capacity, "\"scan_spans\":[");
+    for (uint32_t i = 0u; i < s_scan_probe.count[kind] && used < capacity; ++i) {
+        const NvkScanProbeSpan *r = &s_scan_probe.spans[kind][i];
+        used += (size_t)snprintf(buffer + used, capacity - used,
+            "%s{\"image\":%u,\"plane\":%u,\"path\":%u,\"y\":%u,\"rows\":%u,\"sx\":%u,\"sy\":%u,\"dx\":%u,"
+            "\"span\":%u,\"size\":[%u,%u],\"color\":[%u,%u],\"page\":[%u,%u],\"raster\":[%.9g,%.9g,%.9g,%.9g],"
+            "\"mapping\":[%.9g,%.9g,%.9g,%.9g],\"rect\":[%d,%d,%d,%d]}",
+            i ? "," : "", r->image, r->index, r->path, r->y, r->rows, r->sx, r->sy, r->dx, r->span,
+            r->width, r->height, r->color_width, r->color_height, r->page_rows, r->page_pixels,
+            r->raster[0], r->raster[1], r->raster[2], r->raster[3],
+            r->mapping[0], r->mapping[1], r->mapping[2], r->mapping[3], r->rect[0], r->rect[1], r->rect[2], r->rect[3]);
+    }
+    if (used < capacity) used += (size_t)snprintf(buffer + used, capacity - used, "]");
+    SDL_AtomicUnlock(&s_scan_probe_lock);
+    return used < capacity ? used : 0u;
+}
+
 static int nvk_scanout_image_impl(unsigned image);
 
 /* A phase image whose spans all map one source pixel to one output pixel is
@@ -4225,6 +4572,12 @@ static int nvk_scanout_copy(unsigned image, NvkPlane *output, float output_scale
             if (x1 > x0 && y1 > y0) {
                 if (count == sizeof(regions) / sizeof(regions[0]) || x0 + shift_x < 0 || y0 + shift_y < 0 ||
                     x1 + shift_x > (int32_t)input->color.width || y1 + shift_y > (int32_t)input->color.height) return -1;
+                {
+                    const float probe_mapping[4] = { map_x, map_y, (float)shift_x, (float)shift_y };
+                    const int32_t probe_rect[4] = { x0, y0, x1 - x0, y1 - y0 };
+                    nvk_scan_probe_span(image, GL_NATIVE_GPU_PHASE_BASE + image - 1u, 1u, y, rows, sx, sy, x, span,
+                        input, probe_mapping, probe_rect);
+                }
                 VkImageCopy *r = &regions[count++];
                 memset(r, 0, sizeof(*r));
                 r->srcSubresource = r->dstSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
@@ -4248,6 +4601,7 @@ static int nvk_scanout_image(unsigned image)
 {
     const uint32_t query = nvk_detail_begin(2u);
     const int result = nvk_scanout_image_impl(image);
+    nvk_scan_probe_finish(image);
     nvk_detail_end(query);
     if (result) R.scanned_images[image] = 1u;
     return result;
@@ -4329,6 +4683,7 @@ static int nvk_scanout_image_impl(unsigned image)
                 (int32_t)(native_resolution_edge(y + rows, work->scanout_height, output_height) - y0) };
             const VkRect2D scissor = { { rect[0], rect[1] }, { (uint32_t)rect[2], (uint32_t)rect[3] } };
             vkCmdSetScissor(R.cmd, 0u, 1u, &scissor);
+            nvk_scan_probe_span(image, (unsigned)index, 0u, y, rows, sx, sy, dx, span, input, mapping, rect);
             ++P.draw_calls; vkCmdDraw(R.cmd, 3u, 1u, 0u, 0u);
             x += span;
         }
@@ -4688,6 +5043,7 @@ static void nvk_teardown(void)
     for (unsigned i = 0u; i < NVK_IMAGES; ++i) vk_core_buffer_destroy(&R.readback[i]);
     if (P.pool) { vkDestroyQueryPool(dev, P.pool, NULL); P.pool = VK_NULL_HANDLE; }
     if (P.submit_pool) { vkDestroyQueryPool(dev, P.submit_pool, NULL); P.submit_pool = VK_NULL_HANDLE; }
+    if (P.stat_pool) { vkDestroyQueryPool(dev, P.stat_pool, NULL); P.stat_pool = VK_NULL_HANDLE; }
     if (S.pool) vkDestroyCommandPool(dev, S.pool, NULL);
     if (S.sampler_clamp) vkDestroySampler(dev, S.sampler_clamp, NULL);
     for (uint32_t i = 0u; i < 5u; ++i) if (S.sampler_aniso[i]) vkDestroySampler(dev, S.sampler_aniso[i], NULL);
@@ -4754,15 +5110,8 @@ static int nvk_init(void)
         caps->max_texel_buffer_elements >= NVK_ARENA_CHUNK / 16u && tier && tier[0] == '1';
     const char *specialize = getenv("PSX_NATIVE_VK_SPECIALIZE");
     S.specialize_materials = !S.interlock && !(specialize && specialize[0] == '0');
-    const char *hardware_aniso = getenv("PSX_NATIVE_VK_HARDWARE_ANISO");
-    S.hardware_aniso = S.specialize_materials && caps->sampler_anisotropy && caps->max_sampler_anisotropy >= 16.f &&
-        !(hardware_aniso && hardware_aniso[0] == '0');
-    if (S.hardware_aniso) {
-        VkFormatProperties format;
-        vkGetPhysicalDeviceFormatProperties(vk_core_physical_device(), VK_FORMAT_R8G8B8A8_UNORM, &format);
-        const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        S.hardware_aniso = (format.optimalTilingFeatures & required) == required;
-    }
+    /* Anisotropic filtering is always off: no filtered decode copies. */
+    S.hardware_aniso = 0;
     const char *committed_delta = getenv("PSX_NATIVE_VK_COMMITTED_DELTA");
     S.committed_delta = !(committed_delta && committed_delta[0] == '0');
     const char *merge_runs = getenv("PSX_NATIVE_VK_MERGE_RUNS");
@@ -4771,8 +5120,6 @@ static int nvk_init(void)
     S.scan_copy = !(scan_copy && scan_copy[0] == '0');
     const char *early = getenv("PSX_NATIVE_VK_EARLY_REJECT");
     S.early_reject = early && early[0] == '1';
-    const char *single_tap = getenv("PSX_NATIVE_VK_ANISO_SINGLE_TAP");
-    S.aniso_single_tap = single_tap && single_tap[0] == '2' ? 2 : single_tap && single_tap[0] == '1' ? 1 : 0;
     const char *gather = getenv("PSX_NATIVE_VK_ANISO_GATHER");
     S.aniso_gather = gather && gather[0] == '1';
     const char *sort = getenv("PSX_NATIVE_VK_SORT_MATERIALS");
@@ -4834,8 +5181,9 @@ static int nvk_init(void)
     S.first_vertex_records = first_records && first_records[0] == '1';
     const char *lazy_vertices = getenv("PSX_NATIVE_VK_LAZY_VERTICES");
     S.lazy_vertices = S.core_batch && lazy_vertices && lazy_vertices[0] == '1';
-    S.vertex_footprint = properties.limits.maxVertexOutputComponents >= 72u &&
-        properties.limits.maxFragmentInputComponents >= 72u && !(footprint && footprint[0] == '0');
+    /* The vertex footprint only served anisotropic filtering, which is always off. */
+    (void)footprint; (void)properties;
+    S.vertex_footprint = 0;
     const char *tile = getenv("PSX_NATIVE_VK_DAMAGE_TILE");
     S.damage_tile_shift = tile && !strcmp(tile, "4") ? 2u : tile && !strcmp(tile, "8") ? 3u : tile && !strcmp(tile, "16") ? 4u : tile && !strcmp(tile, "32") ? 5u : 6u;
     S.damage_tile_set = tile != NULL;
@@ -4846,7 +5194,7 @@ static int nvk_init(void)
      * slot; scissored damage rectangles never rasterize those pixels. */
     S.shader_damage = shader_damage && shader_damage[0] == '1';
     const char *regions = getenv("PSX_NATIVE_VK_SMAA_REGIONS");
-    S.damage_regions = regions && regions[0] == '2' ? 4 : regions && regions[0] == '1' ? 2 : 0;
+    S.damage_regions = regions && regions[0] == '0' ? 0 : regions && regions[0] == '1' ? 2 : 4;
     const char *depth_bounds = getenv("PSX_NATIVE_VK_DEPTH_BOUNDS");
     S.depth_bounds = !S.interlock && depth_bounds && depth_bounds[0] == '1';
     S.submit_draw_limit = NVK_SUBMIT_DRAWS;
@@ -5058,10 +5406,12 @@ static int nvk_init(void)
     S.pipe_scan = nvk_make_pipeline(S.pl_scan, S.pass_scan_load, spv_fullscreen_vert, spv_fullscreen_vert_size,
                                     spv_scanout_resolve_frag, spv_scanout_resolve_frag_size, 0, 1, "native scanout");
     const char *arrays = getenv("PSX_NATIVE_VK_DECODE_ARRAYS");
-    S.decode_arrays = arrays && arrays[0] == '1';
+    /* One layered image keeps the decoded view constant, so triangles of
+     * different pages and palettes stay in one batch (the layer travels in page.x). */
+    S.decode_arrays = !(arrays && arrays[0] == '0');
     const char *decode = getenv("PSX_NATIVE_VK_DECODE_TEXTURES");
     const char *persistent_decode = getenv("PSX_NATIVE_VK_PERSISTENT_DECODE");
-    S.persistent_decode = S.hardware_aniso || (persistent_decode && persistent_decode[0] == '1');
+    S.persistent_decode = !(persistent_decode && persistent_decode[0] == '0');
     const char *decode_hints = getenv("PSX_NATIVE_VK_DECODE_HINTS");
     S.decode_hints = decode_hints && decode_hints[0] == '1';
     const char *descriptor_hints = getenv("PSX_NATIVE_VK_DESCRIPTOR_HINTS");
@@ -5142,6 +5492,15 @@ static int nvk_init(void)
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NVK_SUBMIT_TS;
         if (!vk_core_check(vkCreateQueryPool(dev, &qi, NULL, &P.submit_pool), "submit timing pool"))
             P.submit_pool = VK_NULL_HANDLE;
+    }
+    const char *stats = getenv("PSX_NATIVE_VK_PIPELINE_STATS");
+    if (stats && stats[0] == '1' && caps->pipeline_statistics) {
+        VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = NVK_SUBMIT_TS;
+        qi.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        if (!vk_core_check(vkCreateQueryPool(dev, &qi, NULL, &P.stat_pool), "pipeline statistics pool"))
+            P.stat_pool = VK_NULL_HANDLE;
     }
     if (gpu_timing && gpu_timing[0] == '1' && caps->timestamps && caps->timestamp_period_ns > 0.f) {
         VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
@@ -5248,7 +5607,8 @@ static int s_backend_mode;
 static int nvk_wants_readback(unsigned image)
 {
     return !s_backend_mode || (image == 0u && (!R.hash_groups || gl_renderer_native_guest_reference_enabled())) ||
-           s_native_recipe_audit_enabled || s_native_phase_hashes_enabled || s_native_motion_probe.target_vblank;
+           s_native_recipe_audit_enabled || s_native_phase_hashes_enabled || s_native_motion_probe.target_vblank ||
+           nvk_image_probe_wants(R.work, image);
 }
 
 static int nvk_capture_work_eligible(const GlNativeGpuWork *work)
@@ -5548,7 +5908,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
         if (!R.scanned_images[image] && !nvk_scanout_image(image)) {
             R.damage_count = 0u;
             R.damage_shader_active = 0;
-            return -1;
+                        return -1;
         }
         NvkPlane spare = R.planes[seed->plane];
         R.planes[seed->plane] = R.planes[old_seed->plane];
@@ -5581,8 +5941,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
     }
     R.damage_plane = seed->plane;
     const unsigned image = seed->plane - GL_NATIVE_GPU_PHASE_BASE + 1u;
-    /* Scanout damage is in image pixels: physical ones for a host-grid plane,
-     * whose regions stay unpublished. */
+    /* Scanout damage is in image pixels: physical ones for a host-grid plane. */
     if (R.work->scanout && image < NVK_IMAGES && scale == R.work->scale) {
         NvkPlane *output = &S.images[image];
         int32_t bounds[4] = { clip[2], clip[3], clip[0], clip[1] };
@@ -5602,7 +5961,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
         } else memset(bounds, 0, sizeof(bounds));
         memcpy(output->damage_bounds, bounds, sizeof(bounds));
         output->damage_valid = 1;
-        output->damage_regions_side = mapped ? 0 : S.damage_regions;
+        output->damage_regions_side = S.damage_regions;
         if (output->damage_regions_side) {
             memset(output->damage_regions, 0, sizeof(output->damage_regions));
             const unsigned side = (unsigned)S.damage_regions;
@@ -5622,8 +5981,11 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
                     if (b[2] < x1) b[2] = x1; if (b[3] < y1) b[3] = y1;
                 }
                 if (b[0] < b[2] && b[1] < b[3]) {
-                    for (unsigned j = 0u; j < 4u; ++j) b[j] -= clip[j & 1u];
-                    memcpy(output->damage_regions[q], b, sizeof(b));
+                    for (unsigned j = 0u; j < 4u; ++j)
+                        b[j] = mapped ? nvk_raster_edge_in(plane, b[j], j & 1u, origin) -
+                                        nvk_raster_edge_in(plane, clip[j & 1u], j & 1u, origin)
+                                      : b[j] - clip[j & 1u];
+                    if (b[0] < b[2] && b[1] < b[3]) memcpy(output->damage_regions[q], b, sizeof(b));
                 }
             }
         }
@@ -5919,6 +6281,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     P.streamed_works += streaming;
     memset(&R.c, 0, sizeof(R.c));
     R.work = work;
+    nvk_command_probe_work(work, base_commands, base_count);
     R.capture_active = R.capture_used = 0;
     R.capture_eligible = -1;
     if (work->render_width || !out_fence || phase_retry || !nvk_capture_reserve(work)) R.capture_eligible = 0;
@@ -5926,7 +6289,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     R.damage_region = -1;
     R.damage_shader_active = 0;
     R.texture_filter = gr_texture_filter(); R.sprite_filter = s_sprite_filter;
-    R.anisotropy = gl_renderer_anisotropy(); R.filter_strength = gl_renderer_scene_filter_strength();
+    R.filter_strength = gl_renderer_scene_filter_strength();
     R.fail_stage = 0u; R.fail_command = 0u; R.fail_kind = 0u; R.fail_code = 0;
     R.pass_plane = NULL;
     memset(&R.b, 0, sizeof(R.b));
@@ -5989,8 +6352,17 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
                 break;
             }
             int32_t delta[4];
-            const int known = nvk_committed_delta(&R.planes[i], &S.committed[i], i, delta);
-            if (known >= 0) {
+            const int relayout = S.committed[i].page_rows != R.planes[i].page_rows ||
+                S.committed[i].page_pixels != R.planes[i].page_pixels;
+            const int known = relayout ? 0 : nvk_committed_delta(&R.planes[i], &S.committed[i], i, delta);
+            if (relayout) {
+                /* Only the framebuffer alias changed: keep the resident pixels. */
+                nvk_plane_copy_relayout(&S.committed[i], &R.planes[i], 0);
+                if (S.committed[i].has_key) {
+                    ok = nvk_plane_depth(&R.planes[i]);
+                    if (ok) nvk_plane_copy_relayout(&S.committed[i], &R.planes[i], 1);
+                }
+            } else if (known >= 0) {
                 nvk_plane_copy_rect(&S.committed[i], &R.planes[i], 0, 3u, known ? delta : NULL);
                 if (S.committed[i].has_key) {
                     ok = nvk_plane_depth(&R.planes[i]);
@@ -6146,6 +6518,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
             if (damaged < 0) { ok = 0; break; }
         }
         R.damage_active = damaged;
+        nvk_command_probe_chunk(work, &chunk);
         if (ok && sealed) nvk_preplan_begin_chunk(c);
         if (ok && chunk.count && (!damaged || R.damage_count))
             ok = nvk_slice(chunk.commands, chunk.data, 0u, chunk.count, chunk.geometry);
@@ -6155,7 +6528,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
         nvk_pass_end();
         R.damage_active = 0;
         R.damage_shader_active = 0;
-        if ((streaming || S.pace_limit) && ok) {
+            if ((streaming || S.pace_limit) && ok) {
             P.streamed_chunks += !sealed;
             ok = nvk_submit_partial(VK_NULL_HANDLE);
         }
@@ -6689,12 +7062,25 @@ static int nvk_backend_complete(GlNativeGpuWork *work, uint64_t started, uint64_
     int hashes_ok = 1;
     size_t mapped_bytes = 0u;
     const uint64_t complete_started = SDL_GetTicksNS();
+    if (status == XG_RENDER_FENCE_READY && P.stat_pool && P.stat_queries) {
+        uint64_t stats[NVK_SUBMIT_TS][2];
+        if (vkGetQueryPoolResults(vk_core_device(), P.stat_pool, 0u, P.stat_queries, sizeof(stats), stats,
+                sizeof(stats[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            for (uint32_t q = 0u; q < P.stat_queries; ++q) { P.stat_primitives += stats[q][0]; P.stat_fragments += stats[q][1]; }
+    }
     if (status == XG_RENDER_FENCE_READY && P.submit_pool && P.submit_queries) {
         uint64_t times[NVK_SUBMIT_TS];
         if (vkGetQueryPoolResults(vk_core_device(), P.submit_pool, 0u, P.submit_queries,
             sizeof(times), times, sizeof(times[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            ++s_submit_timeline_works;
             for (uint32_t q = 0u; q < P.submit_queries; q += 2u) {
                 const uint64_t ns = (uint64_t)((times[q+1u] - times[q]) * (double)vk_core_caps()->timestamp_period_ns);
+                const double period = vk_core_caps()->timestamp_period_ns;
+                uint64_t *entry = s_submit_timeline[s_submit_timeline_count++ % NVK_TIMELINE];
+                entry[0] = (uint64_t)(times[q] * period);
+                entry[1] = (uint64_t)(times[q + 1u] * period);
+                entry[2] = s_submit_timeline_works;
+                entry[3] = work->phase_count;
                 ++P.timed_submits;
                 P.submit_gpu_ns += ns;
                 if (ns > P.submit_gpu_max_ns) P.submit_gpu_max_ns = ns;
@@ -6725,6 +7111,11 @@ static int nvk_backend_complete(GlNativeGpuWork *work, uint64_t started, uint64_
             ++P.gpu_works;
             P.base_gpu_ns += (uint64_t)((double)(ts[5]-ts[4]) * vk_core_caps()->timestamp_period_ns);
             P.phases_gpu_ns += (uint64_t)((double)(ts[7]-ts[6]) * vk_core_caps()->timestamp_period_ns);
+            const double period = vk_core_caps()->timestamp_period_ns;
+            work->timing.gpu_span_ns = (uint64_t)((ts[3]-ts[0]) * period);
+            work->timing.gpu_base_ns = (uint64_t)((ts[5]-ts[4]) * period);
+            work->timing.gpu_phases_ns = (uint64_t)((ts[7]-ts[6]) * period);
+            work->timing.gpu_scanout_ns = (uint64_t)((ts[3]-ts[2]) * period);
             for (unsigned i = 0u; i < NVK_GPU_PHASES; ++i) {
                 const uint64_t ns = (uint64_t)((double)(ts[i + 1u] - ts[i]) * vk_core_caps()->timestamp_period_ns);
                 P.gpu_ns[i] += ns;
@@ -6762,6 +7153,8 @@ static int nvk_backend_complete(GlNativeGpuWork *work, uint64_t started, uint64_
             vk_core_buffer_invalidate(&R.readback[i], 0, VK_WHOLE_SIZE);
             const uint8_t *pixels = R.readback[i].mapped;
             mapped_bytes += bytes;
+            if (nvk_image_probe_wants(work, i))
+                nvk_image_probe_store(work, i, pixels, S.images[i].width, S.images[i].height);
             if (s_native_motion_probe.target_vblank) {
                 if (s_native_gpu_readback_capacity[i] >= bytes) {
                     work->readback_pixels[i] = s_native_gpu_readback_spare[i];
@@ -7132,6 +7525,27 @@ void native_vk_backend_stop(void)
     g_native_backend = NULL;
 }
 
+int native_vk_timeline_json(char *out, int capacity)
+{
+    extern unsigned native_vk_compose_timeline(uint64_t (*out)[2], unsigned capacity);
+    static uint64_t composes[1024][2];
+    const unsigned compose_count = native_vk_compose_timeline(composes, 1024u);
+    int n = snprintf(out, (size_t)capacity, "{\"submits\":[");
+    const uint64_t total = s_submit_timeline_count;
+    const uint64_t first = total > NVK_TIMELINE ? total - NVK_TIMELINE : 0u;
+    for (uint64_t i = first; i < total && n < capacity; ++i) {
+        const uint64_t *e = s_submit_timeline[i % NVK_TIMELINE];
+        n += snprintf(out + n, (size_t)(capacity - n), "%s[%llu,%llu,%llu,%llu]", i == first ? "" : ",",
+            (unsigned long long)e[0], (unsigned long long)e[1], (unsigned long long)e[2], (unsigned long long)e[3]);
+    }
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "],\"composes\":[");
+    for (unsigned i = 0u; i < compose_count && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s[%llu,%llu]", i ? "," : "",
+            (unsigned long long)composes[i][0], (unsigned long long)composes[i][1]);
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "]}");
+    return n;
+}
+
 int native_vk_backend_json(char *out, int capacity)
 {
     int n = snprintf(out, (size_t)capacity,
@@ -7140,11 +7554,12 @@ int native_vk_backend_json(char *out, int capacity)
         "\"layout_cache_resets\":%llu,\"layout_cache_evictions\":%llu,\"layout_cache_evicted_bytes\":%llu,"
         "\"streamed_works\":%llu,\"streamed_chunks\":%llu,\"cleared_spans\":%llu,\"cleared_rects\":%llu,\"damage_bounds_pixels\":%llu,"
         "\"capture_pixels\":%llu,\"capture_full_pixels\":%llu,"
+        "\"stat_fragments\":%llu,\"stat_primitives\":%llu,"
         "\"timed_submits\":%llu,\"submit_gpu_ns\":%llu,\"submit_gpu_max_ns\":%llu,\"submit_timing_overflow\":%llu,"
         "\"rendered_phases\":%llu,\"schedule_cache_hits\":%llu,\"core_batches\":%llu,\"core_batch_triangles\":%llu,\"draw_calls\":%llu,\"submissions\":%llu,"
         "\"raw_vertex_upload_bytes\":%llu,\"submit_worker\":%d,\"queue_ahead\":%u,\"fragment_node_bytes\":%u,"
         "\"narrow_submits\":%llu,\"wide_submits\":%llu,"
-        "\"decoded_pages\":%llu,\"decoded_reuses\":%llu,\"decoded_hint_hits\":%llu,\"decoded_hint_misses\":%llu,\"decoded_negative_hits\":%llu,\"decoded_work_full\":%llu,\"decoded_slots_full\":%llu,\"aniso_single_tap_triangles\":%llu,\"damage_phases\":%llu,\"damage_pixels\":%llu,\"damage_full_pixels\":%llu,"
+        "\"decoded_pages\":%llu,\"decoded_reuses\":%llu,\"decoded_hint_hits\":%llu,\"decoded_hint_misses\":%llu,\"decoded_negative_hits\":%llu,\"decoded_work_full\":%llu,\"decoded_slots_full\":%llu,\"damage_phases\":%llu,\"damage_pixels\":%llu,\"damage_full_pixels\":%llu,"
         "\"descriptor_hint_hits\":%llu,\"descriptor_hint_misses\":%llu,"
         "\"depth_reads_elided\":%llu,\"capture_runs\":%llu,\"capture_triangles\":%llu,\"capture_retries\":%llu,"
         "\"decoded_arrays\":%d,\"damage_tile\":%u,\"hd_batch\":%d,\"linked_capture\":%d,\"capture_retry_bits\":%u,\"hardware_aniso\":%d,\"refusals\":{",
@@ -7157,6 +7572,7 @@ int native_vk_backend_json(char *out, int capacity)
         (unsigned long long)P.cleared_spans, (unsigned long long)P.cleared_rects,
         (unsigned long long)P.damage_bounds_pixels,
         (unsigned long long)P.capture_pixels, (unsigned long long)P.capture_full_pixels,
+        (unsigned long long)P.stat_fragments, (unsigned long long)P.stat_primitives,
         (unsigned long long)P.timed_submits, (unsigned long long)P.submit_gpu_ns,
         (unsigned long long)P.submit_gpu_max_ns, (unsigned long long)P.submit_timing_overflow,
         (unsigned long long)P.rendered_phases,
@@ -7168,7 +7584,7 @@ int native_vk_backend_json(char *out, int capacity)
         (unsigned long long)P.decoded_hint_hits, (unsigned long long)P.decoded_hint_misses,
         (unsigned long long)P.decoded_negative_hits,
         (unsigned long long)P.decoded_work_full, (unsigned long long)P.decoded_slots_full,
-        (unsigned long long)P.aniso_single_tap_triangles, (unsigned long long)P.damage_phases,
+        (unsigned long long)P.damage_phases,
         (unsigned long long)P.damage_pixels, (unsigned long long)P.damage_full_pixels,
         (unsigned long long)P.descriptor_hint_hits, (unsigned long long)P.descriptor_hint_misses,
         (unsigned long long)P.depth_reads_elided,
@@ -7182,8 +7598,21 @@ int native_vk_backend_json(char *out, int capacity)
         (unsigned long long)P.batch_draws[0], (unsigned long long)P.batch_triangles[0],
         (unsigned long long)P.batch_draws[1], (unsigned long long)P.batch_triangles[1],
         (unsigned long long)P.batch_draws[2], (unsigned long long)P.batch_triangles[2]);
+    for (unsigned i = 0u; i < NVK_BREAK_COUNT && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "},\"batch_breaks\":{",
+                      s_break_names[i], (unsigned long long)P.batch_breaks[i]);
+    for (unsigned i = 0u; i < 16u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s%llu", i ? "," : "},\"batch_key_breaks\":[",
+                      (unsigned long long)P.batch_key_breaks[i]);
+    for (unsigned i = 0u; i < 24u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s%llu", i ? "," : "],\"batch_draw_breaks\":[",
+                      (unsigned long long)P.batch_draw_breaks[i]);
+    for (unsigned i = 0u; i < 64u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s%llu", i ? "," : "],\"batch_combo\":[",
+                      (unsigned long long)P.batch_combo[i]);
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "]");
     if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n),
-        "},\"capture_gpu\":{\"runs\":%llu,\"reset_ns\":%llu,\"draw_ns\":%llu,\"resolve_ns\":%llu,\"base_ns\":%llu,\"phases_ns\":%llu",
+        ",\"capture_gpu\":{\"runs\":%llu,\"reset_ns\":%llu,\"draw_ns\":%llu,\"resolve_ns\":%llu,\"base_ns\":%llu,\"phases_ns\":%llu",
         (unsigned long long)P.capture_gpu_runs, (unsigned long long)P.capture_gpu_ns[0],
         (unsigned long long)P.capture_gpu_ns[1], (unsigned long long)P.capture_gpu_ns[2],
         (unsigned long long)P.base_gpu_ns, (unsigned long long)P.phases_gpu_ns);

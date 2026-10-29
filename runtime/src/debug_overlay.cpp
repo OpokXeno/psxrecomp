@@ -1359,16 +1359,6 @@ static void draw_toggles_section(void)
         (void)psx_debug_overlay_widget_action("spritefilter", sprite_filter, 0);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Independent sampling for Native sprites and UI art.");
-    static const char *kAnisotropyLabels[] = {"Off", "2x", "4x", "8x", "16x"};
-    static const int kAnisotropyValues[] = {0, 2, 4, 8, 16};
-    const int anisotropy = gl_renderer_anisotropy();
-    int aniso_index = 0;
-    for (int i = 1; i < 5; ++i)
-        if (anisotropy == kAnisotropyValues[i]) aniso_index = i;
-    if (ImGui::Combo("Anisotropic filtering", &aniso_index, kAnisotropyLabels, 5))
-        (void)psx_debug_overlay_widget_action("anisotropy", kAnisotropyValues[aniso_index], 0);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Angled 3D scene textures; works with Nearest or Bilinear. Sprite/UI art is unaffected.");
     bool mipmaps = gl_renderer_debug_mipmaps() != 0;
     if (ImGui::Checkbox("Generate texture mipmaps (experimental)", &mipmaps))
         (void)psx_debug_overlay_widget_action("debug_mipmaps", mipmaps ? 1 : 0, 0);
@@ -4370,12 +4360,6 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     }
     if (std::strcmp(name, "spritefilter") == 0) {
         gl_renderer_set_sprite_filter(value ? 1 : 0);
-        return 0;
-    }
-    if (std::strcmp(name, "anisotropy") == 0) {
-        if (value != 0 && value != 2 && value != 4 && value != 8 && value != 16)
-            return -2;
-        gl_renderer_set_anisotropy(value);
         return 0;
     }
     if (std::strcmp(name, "debug_mipmaps") == 0) {

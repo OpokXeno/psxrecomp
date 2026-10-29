@@ -145,6 +145,11 @@ static struct {
     struct { int valid, phase; uint32_t slot, generation; } pend;
     NvkpUiLayer ui[NVKP_UI_LAYERS];
     int ui_front, ui_back;
+    /* Every UI publication or hide; with the composed scene, what the last
+     * present showed. An identical present only makes the desktop compositor
+     * repaint the whole window again (about a third of a capped GPU). */
+    uint64_t ui_generation, presented_draws, presented_ui, duplicate_skips;
+    int presented_scene, presented_valid;
     uint64_t composes, compose_failures, swaps, swap_failures, swap_skips, retired;
     uint64_t compose_draws, compose_reuses, image_updates, phase_composes;
     uint64_t gpu_composes, gpu_compose_ns;
@@ -527,6 +532,23 @@ static void nvkp_lut_update(void)
     P.lut_valid = ok;
 }
 
+/* GPU begin/end of recent composes, in device-timestamp nanoseconds. */
+enum { NVKP_TIMELINE = 1024 };
+static uint64_t s_compose_timeline[NVKP_TIMELINE][2];
+static uint64_t s_compose_timeline_count;
+unsigned native_vk_compose_timeline(uint64_t (*out)[2], unsigned capacity)
+{
+    unsigned count = 0u;
+    const uint64_t total = s_compose_timeline_count;
+    const uint64_t first = total > NVKP_TIMELINE ? total - NVKP_TIMELINE : 0u;
+    for (uint64_t i = first; i < total && count < capacity; ++i) {
+        out[count][0] = s_compose_timeline[i % NVKP_TIMELINE][0];
+        out[count][1] = s_compose_timeline[i % NVKP_TIMELINE][1];
+        ++count;
+    }
+    return count;
+}
+
 /* ---- compose ---------------------------------------------------------------------------------------------------------------------- */
 static void nvkp_audit_check(NvkpSlot *slot)
 {
@@ -672,6 +694,10 @@ static int nvkp_slot_begin(NvkpSlot *slot)
                                      sizeof(times[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
                 ++P.gpu_composes;
                 P.gpu_compose_ns += (uint64_t)((times[1] - times[0]) * (double)vk_core_caps()->timestamp_period_ns);
+                const double period = vk_core_caps()->timestamp_period_ns;
+                const uint64_t n = s_compose_timeline_count++ % NVKP_TIMELINE;
+                s_compose_timeline[n][0] = (uint64_t)(times[0] * period);
+                s_compose_timeline[n][1] = (uint64_t)(times[1] * period);
             }
         }
         if (!vk_core_check(vkResetFences(vk_core_device(), 1u, &slot->fence), "vkResetFences")) return 0;
@@ -980,7 +1006,16 @@ static void nvkp_swap(void *user_data)
     int ok = 0;
     uint32_t blocker = pending ? GL_RENDERER_NATIVE_PRESENT_BLOCKER_SWAP_REJECTED : GL_RENDERER_NATIVE_PRESENT_BLOCKER_INVALID_ARGUMENT;
     int skipped = 0;
-    if (pending && P.composed >= 0) {
+    SDL_LockMutex(s_native_state_mutex);
+    const uint64_t ui_generation = P.ui_generation;
+    SDL_UnlockMutex(s_native_state_mutex);
+    if (pending && P.composed >= 0 && P.presented_valid && P.presented_draws == P.compose_draws &&
+        P.presented_scene == P.composed && P.presented_ui == ui_generation) {
+        /* The window already shows exactly this frame (a variable refresh
+         * display simply holds it). */
+        skipped = 1;
+        ++P.duplicate_skips;
+    } else if (pending && P.composed >= 0) {
         VkSwapFrame frame;
         memset(&frame, 0, sizeof(frame));
         if (T.current) T.current->acquire_begin_ns = nvkp_clock_ns(NULL);
@@ -1059,6 +1094,10 @@ static void nvkp_swap(void *user_data)
                     T.current->requested = psx_wayland_presentation_request(T.current->sequence);
             }
             ok = vk_swapchain_present(&frame, 0u, NULL, NULL, 0u, NULL);
+            P.presented_valid = ok;
+            P.presented_draws = P.compose_draws;
+            P.presented_scene = P.composed;
+            P.presented_ui = ui_generation;
             if (T.current) {
                 T.current->present_end_ns = nvkp_clock_ns(NULL);
                 T.current->queued = ok;
@@ -1076,6 +1115,7 @@ static void nvkp_swap(void *user_data)
             }
         } else if (got == VK_SWAP_ACQUIRE_SKIP) {
             skipped = 1;   /* minimized: nothing to show, not an error */
+            P.presented_valid = 0;
         }
         if (!ok && !skipped) blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_SWAP_REJECTED;
     }
@@ -1206,6 +1246,7 @@ int native_vk_ui_end_rect(int x, int y, int width, int height)
     layer->clip[2] = right > x ? (int)(right - x) : 0;
     layer->clip[3] = bottom > y ? (int)(bottom - y) : 0;
     P.ui_front = ok && layer->clip[2] && layer->clip[3] ? P.ui_back : -1;
+    ++P.ui_generation;
     SDL_UnlockMutex(s_native_state_mutex);
     P.ui_back = -1;
     return ok;
@@ -1221,6 +1262,7 @@ void native_vk_ui_hide(void)
 {
     if (!s_native_state_mutex) return;
     SDL_LockMutex(s_native_state_mutex);
+    if (P.ui_front >= 0) ++P.ui_generation;
     P.ui_front = -1;
     SDL_UnlockMutex(s_native_state_mutex);
 }
@@ -1310,7 +1352,7 @@ static int nvkp_create(struct SDL_Window *window)
     /* Damaged resolves match complete ones bit for bit (PSX_NATIVE_VK_SMAA_AUDIT). */
     P.smaa_damage = !(damage && damage[0] == '0');
     P.smaa_audit = P.smaa_damage && audit && audit[0] == '1';
-    P.smaa_regions = !P.smaa_damage || !regions ? 0 : regions[0] == '2' ? 2 : regions[0] == '1' ? 1 : 0;
+    P.smaa_regions = !P.smaa_damage || (regions && regions[0] == '0') ? 0 : regions && regions[0] == '1' ? 1 : 2;
     if (P.smaa_prepass) {
         VkFormatProperties format;
         vkGetPhysicalDeviceFormatProperties(vk_core_physical_device(), VK_FORMAT_R16G16B16A16_SFLOAT, &format);
@@ -1525,14 +1567,14 @@ int native_vk_services_json(char *out, int capacity)
     }
     return snprintf(out, (size_t)capacity,
         "{\"window_on_primary\":%d,\"host_display\":%d,\"host_refresh_hz\":%.3f,\"active\":%d,\"composes\":%llu,\"compose_failures\":%llu,\"swaps\":%llu,\"swap_failures\":%llu,"
-        "\"swap_skips\":%llu,\"retired\":%llu,\"scene\":[%u,%u],\"lut\":%d,\"frames_presented\":%llu,"
+        "\"swap_skips\":%llu,\"duplicate_skips\":%llu,\"retired\":%llu,\"scene\":[%u,%u],\"lut\":%d,\"frames_presented\":%llu,"
         "\"compose_draws\":%llu,\"compose_reuses\":%llu,\"image_updates\":%llu,\"phase_composes\":%llu,"
         "\"partial_composes\":%llu,\"partial_pixels\":%llu,\"partial_regions\":%llu,\"full_pixels\":%llu,\"audit_checks\":%llu,\"audit_mismatches\":%llu,"
         "\"gpu_composes\":%llu,\"gpu_compose_ns\":%llu,\"gpu_swaps\":%llu,\"gpu_swap_ns\":%llu,\"ui_clip\":[%d,%d,%d,%d],\"ui_storage\":[%u,%u],"
         "\"window_maximized\":%d,\"window_fullscreen\":%d,\"window_focused\":%d,\"window_mouse_focused\":%d,"
         "\"compose_wait_ns\":%llu,\"ui_consume_wait_ns\":%llu,\"scene_rebuilds\":%llu,\"ui_updates\":%llu,\"executor\":%s}",
         display == primary, display, (double)mode.refresh_rate, P.services, (unsigned long long)P.composes, (unsigned long long)P.compose_failures, (unsigned long long)P.swaps,
-        (unsigned long long)P.swap_failures, (unsigned long long)P.swap_skips, (unsigned long long)P.retired,
+        (unsigned long long)P.swap_failures, (unsigned long long)P.swap_skips, (unsigned long long)P.duplicate_skips, (unsigned long long)P.retired,
         P.scene_w, P.scene_h, P.lut_valid, (unsigned long long)sw.frames_presented,
         (unsigned long long)P.compose_draws, (unsigned long long)P.compose_reuses,
         (unsigned long long)P.image_updates, (unsigned long long)P.phase_composes,

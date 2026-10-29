@@ -617,6 +617,7 @@ typedef struct GlNativeWorkTiming {
     uint64_t begin_ns, compile_cpu_ns, queued_ns, dispatch_begin_ns, dispatch_end_ns;
     uint64_t ready_ns, hash_begin_ns, hash_end_ns, hash_cpu_ns, end_ns;
     uint64_t service_ns, service_cpu_ns, copy_ns;
+    uint64_t gpu_span_ns, gpu_base_ns, gpu_phases_ns, gpu_scanout_ns; /* GPU timestamps */
     XgPresentationIdentity identity;
     uint64_t digest;
     uint64_t deadline_ns, previous_vblank, previous_cycle;
@@ -774,6 +775,8 @@ typedef struct GlNativeAttributePlanes {
     double plane[5][3]; /* UV, RGB: seed, logical d/dx, logical d/dy. */
     uint32_t dda[5][3]; /* Q12 seed and physical-pixel steps, modulo 256. */
     int integral;
+    /* Host-grid plane: the shader evaluates it at physical pixel centres. */
+    int continuous;
     /* Inclusive sampled texel range {lo_u, lo_v, hi_u, hi_v} (gpu_uv.h). */
     int limits[4];
 } GlNativeAttributePlanes;
@@ -866,7 +869,6 @@ extern SDL_atomic_t s_native_wireframe_option;
 extern int s_native_gpu_wireframe_applied;
 uint64_t native_gpu_image_digest(const void *pixels, size_t size, uint64_t *visible);
 int gl_renderer_scene_filter_strength(void);
-int gl_renderer_anisotropy(void);
 int gl_renderer_debug_mipmaps(void);
 uint32_t native_next_generation(uint32_t generation);
 void native_guest_reference_reset_locked(void);

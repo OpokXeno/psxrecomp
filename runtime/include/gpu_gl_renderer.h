@@ -403,6 +403,9 @@ typedef struct GlRendererNativeCompilerDiagnostics {
     XgPresentationIdentity last_temporal_identity;
     uint32_t last_temporal_status;
     uint32_t last_temporal_phase_count;
+    /* Phase planning limiters: cadence-requested phases, and how many each
+     * limiter removed (CPU cost estimate, GPU arrival cap, generation deadline). */
+    uint64_t phase_requested, phase_budget_cut, phase_cap_cut, phase_deadline_cut;
     uint32_t last_temporal_interval_vblanks;
     uint64_t last_temporal_interval_ns;
     uint64_t duplicate_endpoints;
@@ -688,10 +691,6 @@ int  gl_renderer_sprite_filter(void);
  * 100 is the normal filter, 0 renders the exact nearest path. */
 void gl_renderer_set_scene_filter_strength(int percent);
 int  gl_renderer_scene_filter_strength(void);
-/* Native 3D scene texture footprint, independent of nearest/bilinear and
- * sprite/UI filtering: 0 (off), 2, 4, 8 or 16 directional samples. */
-void gl_renderer_set_anisotropy(int samples);
-int  gl_renderer_anisotropy(void);
 /* Debug-only presentation enhancement. Disabled by default; decoded mipmaps
  * are generated on demand per sampled UV rectangle and CLUT. */
 void gl_renderer_set_debug_mipmaps(int enabled);

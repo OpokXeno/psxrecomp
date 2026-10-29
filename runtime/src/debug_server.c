@@ -10500,6 +10500,21 @@ static void handle_native_vk_services(int id, const char *json)
     free(obj);
 }
 
+/* native_gpu_timeline: GPU begin/end of recent timed submissions and
+ * composes (device-timestamp ns), to locate idle gaps on the queue. */
+static void handle_native_gpu_timeline(int id, const char *json)
+{
+    (void)json;
+    extern int native_vk_timeline_json(char *out, int capacity);
+    enum { CAP = 512 * 1024 };
+    char *obj = (char *)malloc(CAP);
+    if (!obj) { send_err(id, "native_gpu_timeline: out of memory"); return; }
+    const int n = native_vk_timeline_json(obj, CAP);
+    if (n >= CAP) send_err(id, "native_gpu_timeline response overflow");
+    else send_fmt("{\"id\":%d,\"ok\":true,\"timeline\":%s}\n", id, obj);
+    free(obj);
+}
+
 /* vk_validation: the most recent Vulkan validation / debug-utils messages
  * ("count", default all kept). */
 static void handle_vk_validation(int id, const char *json)
@@ -10819,6 +10834,101 @@ static const char *native_midpoint_reset_reason_name(uint32_t reason)
     case GL_NATIVE_MIDPOINT_RESET_EXPLICIT:
     default: return "explicit";
     }
+}
+
+/* native_draw_probe: op=arm captures the prepared triangles of the next
+ * endpoint (kind 0) and phase (kind 1) works; op=get returns kind's
+ * header and records [offset, offset + count). */
+static void handle_native_draw_probe(int id, const char *json)
+{
+    extern void native_draw_probe_arm(void);
+    extern size_t native_draw_probe_json(unsigned kind, uint32_t offset, uint32_t count, char *buffer, size_t capacity);
+    extern void nvk_scan_probe_arm(void);
+    extern size_t nvk_scan_probe_json(unsigned kind, char *buffer, size_t capacity);
+    char op[16];
+    if (!json_get_str(json, "op", op, (int)sizeof(op))) { send_err(id, "missing op"); return; }
+    if (!strcmp(op, "arm")) {
+        native_draw_probe_arm();
+        nvk_scan_probe_arm();
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":true}", id);
+        return;
+    }
+    const int kind = json_get_int(json, "kind", 0);
+    if (!strcmp(op, "save")) {
+        extern int nvk_image_probe_take(unsigned kind, uint8_t **rgba, uint32_t *width, uint32_t *height);
+        char path[1024];
+        uint8_t *rgba = NULL;
+        uint32_t w = 0u, h = 0u;
+        if (!json_get_str(json, "path", path, (int)sizeof(path))) { send_err(id, "missing path"); return; }
+        if (kind < 0 || kind > 1 || !nvk_image_probe_take((unsigned)kind, &rgba, &w, &h)) {
+            send_err(id, "no image captured"); return;
+        }
+        for (size_t i = 0u; i < (size_t)w * h; ++i) memmove(rgba + i * 3u, rgba + i * 4u, 3u);
+        FILE *fp = fopen(path, "wb");
+        const int ok = fp && png_write_rgb(fp, rgba, (int)w, (int)h);
+        if (fp) fclose(fp);
+        free(rgba);
+        if (!ok) { send_err(id, "png write failed"); return; }
+        send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}", id, path, w, h);
+        return;
+    }
+    if (!strcmp(op, "commands")) {
+        extern size_t nvk_command_probe_json(unsigned list, uint32_t offset, uint32_t count, char *buffer, size_t capacity);
+        const int list_offset = json_get_int(json, "offset", 0), list_count = json_get_int(json, "count", 512);
+        char *list = (char *)malloc(1024u * 1024u);
+        if (!list) { send_err(id, "out of memory"); return; }
+        if (kind < 0 || kind > 1 || list_offset < 0 || list_count < 1 ||
+            !nvk_command_probe_json((unsigned)kind, (uint32_t)list_offset, (uint32_t)list_count, list, 1024u * 1024u)) {
+            free(list); send_err(id, "bad list or overflow"); return;
+        }
+        send_fmt("{\"id\":%d,\"ok\":true,%s}", id, list);
+        free(list);
+        return;
+    }
+    if (!strcmp(op, "templates")) {
+        extern size_t nvk_template_probe_json(uint32_t offset, uint32_t count, char *buffer, size_t capacity);
+        const int list_offset = json_get_int(json, "offset", 0), list_count = json_get_int(json, "count", 256);
+        char *list = (char *)malloc(1024u * 1024u);
+        if (!list) { send_err(id, "out of memory"); return; }
+        if (list_offset < 0 || list_count < 1 || list_count > 1024 ||
+            !nvk_template_probe_json((uint32_t)list_offset, (uint32_t)list_count, list, 1024u * 1024u)) {
+            free(list); send_err(id, "bad range or overflow"); return;
+        }
+        send_fmt("{\"id\":%d,\"ok\":true,%s}", id, list);
+        free(list);
+        return;
+    }
+    if (strcmp(op, "get")) { send_err(id, "op must be arm|get|save|commands|templates"); return; }
+    const int offset = json_get_int(json, "offset", 0);
+    const int count = json_get_int(json, "count", 64);
+    if (kind < 0 || kind > 1 || offset < 0 || count < 1 || count > 256) { send_err(id, "bad kind/offset/count"); return; }
+    const size_t capacity = 512u * 1024u;
+    char *buffer = (char *)malloc(capacity);
+    if (!buffer) { send_err(id, "out of memory"); return; }
+    if (!native_draw_probe_json((unsigned)kind, (uint32_t)offset, (uint32_t)count, buffer, capacity)) {
+        free(buffer); send_err(id, "probe overflow"); return;
+    }
+    const size_t used = strlen(buffer);
+    if (!nvk_scan_probe_json((unsigned)kind, buffer + used + 1u, capacity - used - 1u)) {
+        free(buffer); send_err(id, "probe overflow"); return;
+    }
+    buffer[used] = ',';
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buffer);
+    free(buffer);
+}
+
+/* native_raster_layout: fixed-resolution raster layout of the last applied
+ * Native work (physical size, guest-to-physical scale, framebuffer page alias). */
+static void handle_native_raster_layout(int id, const char *json)
+{
+    extern void gl_renderer_native_raster_layout(uint32_t out_size[2], float out_scale[2], uint32_t out_page[2]);
+    uint32_t size[2], page[2];
+    float scale[2];
+    (void)json;
+    gl_renderer_native_raster_layout(size, scale, page);
+    send_fmt("{\"id\":%d,\"ok\":true,\"width\":%u,\"height\":%u,\"scale_x\":%.9g,\"scale_y\":%.9g,"
+             "\"page_rows\":%u,\"page_pixels\":%u}",
+             id, size[0], size[1], scale[0], scale[1], page[0], page[1]);
 }
 
 static void handle_native_midpoint_diag(int id, const char *json)
@@ -14734,7 +14844,8 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"selection\":{\"presented_endpoints\":%llu,\"presented_holds\":%llu,"
         "\"visual_only_updates\":%llu,\"guard_empties\":%llu,"
         "\"due_wholes\":%llu,\"phases\":%llu,\"last_remaining_ms\":%lld,"
-        "\"duplicates\":%llu,\"visual_lag_us\":%llu,\"render_lag_us\":%llu},"
+        "\"duplicates\":%llu,\"visual_lag_us\":%llu,\"render_lag_us\":%llu,"
+        "\"phase_cap\":%llu,\"phase_late_batches\":%llu,\"phase_late_skipped\":%llu},"
         "\"publication_open\":%s,\"epoch_terminal\":%s,"
         "\"source_pending\":%s,\"batch_pending\":%s,\"receipts\":{",
         id, failure_flags,
@@ -14807,6 +14918,9 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (unsigned long long)presentation.duplicate_presents,
         (unsigned long long)(presentation.visual_lag_ns / 1000u),
         (unsigned long long)(presentation.render_lag_ns / 1000u),
+        (unsigned long long)presentation.phase_cap,
+        (unsigned long long)presentation.phase_late_batches,
+        (unsigned long long)presentation.phase_late_skipped,
         presentation.publication_open ? "true" : "false",
         presentation.epoch_terminal ? "true" : "false",
         presentation.source_pending ? "true" : "false",
@@ -14916,6 +15030,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"view_targets\":%u,\"view_domains\":%u,"
         "\"expired_phase_generations\":%llu,\"whole_only_phase_generations\":%llu,"
         "\"ready_phase_generations\":%llu,\"last_phase_count\":%u,"
+        "\"phase_requested\":%llu,\"phase_budget_cut\":%llu,\"phase_cap_cut\":%llu,\"phase_deadline_cut\":%llu,"
         "\"last_temporal_status\":\"%s\",\"last_interval_vblanks\":%u,"
         "\"last_swap_alpha\":[%llu,%llu],"
         "\"legacy_owner\":{\"active\":%s,\"canonical_draws\":%llu,"
@@ -15013,6 +15128,8 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (unsigned long long)compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_WHOLE_ONLY],
         (unsigned long long)compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_READY],
         compiler.last_temporal_phase_count,
+        (unsigned long long)compiler.phase_requested, (unsigned long long)compiler.phase_budget_cut,
+        (unsigned long long)compiler.phase_cap_cut, (unsigned long long)compiler.phase_deadline_cut,
         gl_renderer_native_temporal_status_name(compiler.last_temporal_status),
         compiler.last_temporal_interval_vblanks,
         (unsigned long long)presentation.last_alpha_numerator,
@@ -18236,20 +18353,6 @@ static void handle_texture_filter_strength(int id, const char *json)
              gl_renderer_scene_filter_strength());
 }
 
-/* Independent Native 3D texture quality, with live readback. */
-static void handle_anisotropy(int id, const char *json)
-{
-    const int value = json_get_int(json, "value", -1);
-    if (value != -1 && value != 0 && value != 2 && value != 4 &&
-        value != 8 && value != 16) {
-        send_err(id, "value must be 0, 2, 4, 8 or 16");
-        return;
-    }
-    if (value >= 0) gl_renderer_set_anisotropy(value);
-    send_fmt("{\"id\":%d,\"ok\":true,\"value\":%d}\n", id,
-             gl_renderer_anisotropy());
-}
-
 static void handle_mipmap_diag(int id, const char *json)
 {
     GlRendererDebugMipmapDiagnostics d = {0};
@@ -18274,7 +18377,6 @@ static const CmdEntry s_commands[] = {
     { "overlay_force_capture", handle_overlay_force_capture },
     { "overlay_widget_action", handle_overlay_widget_action },
     { "texture_filter_strength", handle_texture_filter_strength },
-    { "anisotropy", handle_anisotropy },
     { "mipmap_diag", handle_mipmap_diag },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
@@ -18336,6 +18438,8 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "native_midpoint_diag", handle_native_midpoint_diag },
+    { "native_raster_layout", handle_native_raster_layout },
+    { "native_draw_probe", handle_native_draw_probe },
     { "native_wave_diag", handle_native_wave_diag },
     { "native_last_motion_diag", handle_native_last_motion_diag },
     { "native_depth_diag", handle_native_depth_diag },
@@ -18554,6 +18658,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_profile",       handle_gpu_profile },
     { "vk_present_shot",   handle_vk_present_shot },
     { "native_vk_services", handle_native_vk_services },
+    { "native_gpu_timeline", handle_native_gpu_timeline },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },
